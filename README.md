@@ -1,4 +1,4 @@
-# Attention Map Visualization
+# attention-map-diffusers
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18304024.svg)](https://doi.org/10.5281/zenodo.18304024)
 
@@ -370,7 +370,7 @@ If you find this code useful in your research, please consider citing:
 ```
 @misc{baek2024attentionmap,
   author = {Wooyeol Baek},
-  title = {Attention Map Visualization},
+  title = {attention-map-diffusers},
   year = {2023},
   publisher = {GitHub},
   journal = {GitHub repository},
