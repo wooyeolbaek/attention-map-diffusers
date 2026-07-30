@@ -122,6 +122,130 @@ or
 pip install attention_map_diffusers
 ```
 
+### Relation-aware capture and visualization API
+```python
+import torch
+from diffusers import FluxPipeline
+from attention_map_diffusers import AttentionCapture, VisualizationConfig
+
+prompt = "A capybara holding a sign that reads Hello World."
+pipe = FluxPipeline.from_pretrained(
+    "black-forest-labs/FLUX.1-schnell",
+    torch_dtype=torch.bfloat16,
+).to("cuda")
+
+with AttentionCapture(
+    pipe,
+    relations=["text->text", "text->image", "image->text", "image->image"],
+    mode="fast",
+    heads="mean",
+    offload="cuda",  # fastest when enough VRAM is available
+    # image->image keeps every query/key patch by default, producing one
+    # key-patch-grid heatmap for every query patch.
+) as capture:
+    images = pipe([prompt], num_inference_steps=4).images
+
+maps = capture.compute()
+maps.save(
+    "outputs/flux-schnell/attention",
+    tokenizer=pipe.tokenizer_2,  # Flux attends to T5 tokens
+    prompts=[prompt],
+    images=images,               # also writes heatmap overlays
+    visualization_config=VisualizationConfig(),
+)
+```
+
+The renderer selects the visualization from the relation metadata:
+
+- `text->text`: one attention matrix with query tokens on the y-axis and key
+  tokens on the x-axis. Padding tokens are omitted.
+- `image->text`: one image-shaped heatmap per key token.
+- `text->image`: one image-shaped heatmap per query token.
+- `image->image`: one key-patch-grid heatmap per selected query patch. If only
+  key patches were selected, it renders the inverse received-attention view.
+
+Each relation is organized as follows:
+
+```text
+attention/
+  metadata.json
+  raw/<relation>/*.pt              # when save_raw=True / --save-raw
+  visuals/<relation>/
+    aggregate/batch-000/
+      maps/*.png                  # pure attention maps
+      overlays/*.png              # generated-image overlays
+                                  # (only for spatial maps with images=...)
+    steps/<timestep>/<layer>/     # when --save-layer-maps is enabled
+    aggregate/overview-batch-000.png
+```
+
+SD3/SD3.5 and Flux joint attention support all four relations. SD/SDXL and
+Sana expose `image->text` cross-attention and `image->image` self-attention.
+For SD3 use `tokenizer_3`; for Flux use `tokenizer_2`; the shared demo runner
+selects this automatically.
+
+The model demos share one runner and support relation-level execution:
+
+```bash
+python demo/run_attention_demo.py --model all --relations all --mode fast --offload cuda
+python demo/demo-sd.py --dry-run
+python demo/demo-flux-dev.py --relations 'image->text,text->image'
+```
+
+By default, demos keep every image query/key patch and write one `image->image`
+map per query patch. Use `--large-relation-query-indices center` or `sample:9`
+only when a smaller diagnostic subset is intentional. All token/patch visuals
+are also written by default; `--max-visual-items N` explicitly caps them. The
+runner saves aggregate visuals by default. Raw `.pt` tensors are not needed for
+PNG rendering and are opt-in through `--save-raw`; save them only for later
+offline numerical analysis or re-rendering. Add `--save-layer-maps` for every
+layer/timestep. `--heads mean` averages heads, `--heads all` retains them all,
+and a comma list such as `--heads 0,2` retains selected heads. `--steps 1` is
+useful only for a smoke test and intentionally produces low-quality images.
+
+The runner uses seed `0` by default and records the effective seed, step count,
+resolution, generated PNG dimensions, and relations in each model's
+`run-config.json`. It warns when `--steps` or an explicit resolution is below
+that model's recommended default. Demos retain the final denoising timestep's
+attention by default so full patch maps stay bounded while the model still runs
+all recommended generation steps; pass `--capture-timesteps all` only when the
+whole denoising trajectory is required. To verify that capture is
+generation-neutral on real model weights, run:
+
+```bash
+python demo/validate_generation_parity.py --model all
+```
+
+Every demo also writes `tensor-validation.json` directly from the in-memory
+attention tensors, so finite values and normalization can be audited without
+storing `.pt` files. Use `--skip-visualization` for a fast numerical-only run.
+Combining it with `--save-raw` skips PNG rendering and VAE decoding while still
+writing metadata and the explicitly requested `.pt` tensors.
+
+To validate a completed native-resolution model/relation matrix, including
+query-patch continuity, map/overlay parity, PNG integrity, generated image
+sizes, and optional in-memory tensor reports:
+
+```bash
+python demo/validate_full_matrix_run.py demo-outputs \
+  --tensor-validation-dir tensor-validation-outputs
+```
+
+To audit a per-model option-coverage matrix, including `fast`/`exact`/`stream`
+pixel parity, all-timestep/layer output counts, raw tensor loading, selected
+query/key/head behavior, PNG integrity, and the map-size safety guard:
+
+```bash
+python demo/validate_option_matrix.py option-matrix-outputs
+```
+
+To audit a completed all-model run (raw tensor shapes, finite values,
+normalization, aggregate coverage, CFG filtering, and PNG integrity):
+
+```bash
+python demo/validate_attention_outputs.py demo-outputs
+```
+
 ### Flux-dev
 ```python
 import torch
