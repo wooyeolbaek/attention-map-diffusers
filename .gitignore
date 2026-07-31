@@ -1,15 +1,17 @@
-__pycache__
+__pycache__/
+*.py[cod]
+.pytest_cache/
 .DS_Store
 
 venv
 .venv
 
-**.egg-info
+*.egg-info/
 
 demo/attn_maps
 demo/**.png
 
-build
-dist
+build/
+dist/
 
-validation-outputs
+validation-outputs/

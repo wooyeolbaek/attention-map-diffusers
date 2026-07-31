@@ -329,6 +329,297 @@ class CaptureFluxAttnProcessor2_0(BaseCaptureProcessor):
         return hidden_states
 
 
+class CaptureFlux2AttnProcessor(BaseCaptureProcessor):
+    """Capture FLUX.2 double-stream attention without changing its backend."""
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        image_rotary_emb=None,
+    ):
+        torch = require_torch()
+        from diffusers.models.attention_dispatch import dispatch_attention_fn
+        from diffusers.models.embeddings import apply_rotary_emb
+
+        query = attn.to_q(hidden_states).unflatten(-1, (attn.heads, -1))
+        key = attn.to_k(hidden_states).unflatten(-1, (attn.heads, -1))
+        value = attn.to_v(hidden_states).unflatten(-1, (attn.heads, -1))
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+        image_tokens = int(query.shape[1])
+        text_tokens = 0
+
+        if encoder_hidden_states is not None:
+            encoder_query = attn.add_q_proj(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
+            encoder_key = attn.add_k_proj(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
+            encoder_value = attn.add_v_proj(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
+            encoder_query = attn.norm_added_q(encoder_query)
+            encoder_key = attn.norm_added_k(encoder_key)
+            text_tokens = int(encoder_query.shape[1])
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        if encoder_hidden_states is not None:
+            context = current_context()
+            self._capture(
+                attention_type="joint",
+                query=query.transpose(1, 2),
+                key=key.transpose(1, 2),
+                layout=_joint_layout_text_image(
+                    text_tokens,
+                    image_tokens,
+                    context.image_grid or infer_2d_grid(image_tokens),
+                ),
+                attention_mask=attention_mask,
+                timestep=context.timestep,
+                metadata=context.metadata,
+            )
+
+        hidden_states = dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            backend=getattr(self.original_processor, "_attention_backend", None),
+            parallel_config=getattr(self.original_processor, "_parallel_config", None),
+        )
+        hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
+        if encoder_hidden_states is not None:
+            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                [text_tokens, hidden_states.shape[1] - text_tokens], dim=1
+            )
+            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+        hidden_states = attn.to_out[1](attn.to_out[0](hidden_states))
+        if encoder_hidden_states is not None:
+            return hidden_states, encoder_hidden_states
+        return hidden_states
+
+
+class CaptureFlux2ParallelSelfAttnProcessor(BaseCaptureProcessor):
+    """Capture FLUX.2 single-stream attention and preserve fused MLP output."""
+
+    def __call__(self, attn, hidden_states, attention_mask=None, image_rotary_emb=None):
+        torch = require_torch()
+        from diffusers.models.attention_dispatch import dispatch_attention_fn
+        from diffusers.models.embeddings import apply_rotary_emb
+
+        projected = attn.to_qkv_mlp_proj(hidden_states)
+        qkv, mlp_hidden_states = torch.split(
+            projected,
+            [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor],
+            dim=-1,
+        )
+        query, key, value = qkv.chunk(3, dim=-1)
+        query = attn.norm_q(query.unflatten(-1, (attn.heads, -1)))
+        key = attn.norm_k(key.unflatten(-1, (attn.heads, -1)))
+        value = value.unflatten(-1, (attn.heads, -1))
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        context = current_context()
+        total_tokens = int(query.shape[1])
+        text_tokens = int(context.text_tokens or 0)
+        if text_tokens > total_tokens:
+            text_tokens = 0
+        image_tokens = total_tokens - text_tokens
+        self._capture(
+            attention_type="joint",
+            query=query.transpose(1, 2),
+            key=key.transpose(1, 2),
+            layout=_joint_layout_text_image(
+                text_tokens,
+                image_tokens,
+                context.image_grid or infer_2d_grid(image_tokens),
+            ),
+            attention_mask=attention_mask,
+            timestep=context.timestep,
+            metadata=context.metadata,
+        )
+
+        hidden_states = dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            backend=getattr(self.original_processor, "_attention_backend", None),
+            parallel_config=getattr(self.original_processor, "_parallel_config", None),
+        )
+        hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
+        mlp_hidden_states = attn.mlp_act_fn(mlp_hidden_states)
+        return attn.to_out(torch.cat([hidden_states, mlp_hidden_states], dim=-1))
+
+
+class CaptureZSingleStreamAttnProcessor(BaseCaptureProcessor):
+    """Capture Z-Image refiner and unified-sequence attention."""
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        freqs_cis=None,
+    ):
+        from diffusers.models.attention_dispatch import dispatch_attention_fn
+
+        query = attn.to_q(hidden_states).unflatten(-1, (attn.heads, -1))
+        key = attn.to_k(hidden_states).unflatten(-1, (attn.heads, -1))
+        value = attn.to_v(hidden_states).unflatten(-1, (attn.heads, -1))
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        if freqs_cis is not None:
+            query = _apply_z_image_rotary(query, freqs_cis)
+            key = _apply_z_image_rotary(key, freqs_cis)
+
+        dtype = query.dtype
+        query, key = query.to(dtype), key.to(dtype)
+        if attention_mask is not None and attention_mask.ndim == 2:
+            attention_mask = attention_mask[:, None, None, :]
+
+        context = current_context()
+        token_count = int(query.shape[1])
+        if ".noise_refiner." in self.layer_id:
+            image_grid = context.image_grid or infer_2d_grid(token_count)
+            image = ModalityRange("image", 0, token_count, image_grid)
+            layout = make_layout([image], [image])
+            attention_type = "self"
+        elif ".context_refiner." in self.layer_id or ".siglip_refiner." in self.layer_id:
+            text = ModalityRange("text", 0, token_count, None)
+            layout = make_layout([text], [text])
+            attention_type = "self"
+        else:
+            image_tokens = int(context.image_tokens or 0)
+            text_tokens = int(context.text_tokens or 0)
+            if image_tokens + text_tokens != token_count:
+                image_tokens = min(image_tokens, token_count)
+                text_tokens = token_count - image_tokens
+            layout = _joint_layout_image_text(
+                image_tokens,
+                text_tokens,
+                context.image_grid or infer_2d_grid(image_tokens),
+            )
+            attention_type = "joint"
+
+        self._capture(
+            attention_type=attention_type,
+            query=query.transpose(1, 2),
+            key=key.transpose(1, 2),
+            layout=layout,
+            attention_mask=attention_mask,
+            timestep=context.timestep,
+            metadata=context.metadata,
+        )
+        hidden_states = dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            backend=getattr(self.original_processor, "_attention_backend", None),
+            parallel_config=getattr(self.original_processor, "_parallel_config", None),
+        )
+        hidden_states = hidden_states.flatten(2, 3).to(dtype)
+        hidden_states = attn.to_out[0](hidden_states)
+        if len(attn.to_out) > 1:
+            hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+
+
+class CapturePRXAttnProcessor2_0(BaseCaptureProcessor):
+    """Capture PRX image queries against text+image keys."""
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        image_rotary_emb=None,
+        **kwargs,
+    ):
+        torch = require_torch()
+        from diffusers.models.attention_dispatch import dispatch_attention_fn
+        from diffusers.models.transformers.transformer_prx import apply_rope
+
+        if encoder_hidden_states is None:
+            raise ValueError("PRX attention requires encoder_hidden_states containing text tokens.")
+        image_qkv = attn.img_qkv_proj(hidden_states)
+        batch_size, image_tokens, _ = image_qkv.shape
+        image_qkv = image_qkv.reshape(batch_size, image_tokens, 3, attn.heads, attn.head_dim)
+        image_qkv = image_qkv.permute(2, 0, 3, 1, 4)
+        image_query, image_key, image_value = image_qkv[0], image_qkv[1], image_qkv[2]
+        image_query = attn.norm_q(image_query)
+        image_key = attn.norm_k(image_key)
+
+        text_kv = attn.txt_kv_proj(encoder_hidden_states)
+        text_tokens = int(text_kv.shape[1])
+        text_kv = text_kv.reshape(batch_size, text_tokens, 2, attn.heads, attn.head_dim)
+        text_kv = text_kv.permute(2, 0, 3, 1, 4)
+        text_key, text_value = text_kv[0], text_kv[1]
+        text_key = attn.norm_added_k(text_key)
+        if image_rotary_emb is not None:
+            image_query = apply_rope(image_query, image_rotary_emb)
+            image_key = apply_rope(image_key, image_rotary_emb)
+
+        key = torch.cat((text_key, image_key), dim=2)
+        value = torch.cat((text_value, image_value), dim=2)
+        attention_mask_tensor = None
+        if attention_mask is not None:
+            if attention_mask.ndim != 2 or attention_mask.shape[-1] != text_tokens:
+                raise ValueError(f"Unsupported PRX attention_mask shape: {attention_mask.shape}")
+            image_mask = torch.ones(
+                (batch_size, image_tokens), dtype=torch.bool, device=image_query.device
+            )
+            joint_mask = torch.cat(
+                [attention_mask.to(device=image_query.device, dtype=torch.bool), image_mask], dim=-1
+            )
+            attention_mask_tensor = joint_mask[:, None, None, :].expand(
+                -1, attn.heads, image_tokens, -1
+            )
+
+        context = current_context()
+        self._capture(
+            attention_type="joint",
+            query=image_query,
+            key=key,
+            layout=_image_query_text_image_key_layout(
+                image_tokens,
+                text_tokens,
+                context.image_grid or infer_2d_grid(image_tokens),
+            ),
+            attention_mask=attention_mask_tensor,
+            timestep=context.timestep,
+            metadata=context.metadata,
+        )
+
+        output = dispatch_attention_fn(
+            image_query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            attn_mask=attention_mask_tensor,
+            backend=getattr(self.original_processor, "_attention_backend", None),
+            parallel_config=getattr(self.original_processor, "_parallel_config", None),
+        )
+        output = output.reshape(batch_size, image_tokens, attn.heads * attn.head_dim)
+        output = attn.to_out[0](output)
+        if len(attn.to_out) > 1:
+            output = attn.to_out[1](output)
+        return output
+
+
 class CaptureSanaAttnProcessor2_0(BaseCaptureProcessor):
     def __call__(
         self,
@@ -545,6 +836,10 @@ SUPPORTED_PROCESSOR_NAMES = {
     "JointAttnProcessor2_0": CaptureJointAttnProcessor2_0,
     "FluxAttnProcessor": CaptureFluxAttnProcessor2_0,
     "FluxAttnProcessor2_0": CaptureFluxAttnProcessor2_0,
+    "Flux2AttnProcessor": CaptureFlux2AttnProcessor,
+    "Flux2ParallelSelfAttnProcessor": CaptureFlux2ParallelSelfAttnProcessor,
+    "ZSingleStreamAttnProcessor": CaptureZSingleStreamAttnProcessor,
+    "PRXAttnProcessor2_0": CapturePRXAttnProcessor2_0,
     "SanaAttnProcessor2_0": CaptureSanaAttnProcessor2_0,
     "SanaLinearAttnProcessor2_0": CaptureSanaLinearAttnProcessor2_0,
 }
@@ -595,3 +890,22 @@ def _joint_layout_text_image(text_tokens: int, image_tokens: int, image_grid: Op
     image = ModalityRange("image", text_tokens, text_tokens + image_tokens, image_grid)
     ranges = [text, image] if text_tokens else [ModalityRange("image", 0, image_tokens, image_grid)]
     return make_layout(ranges, ranges)
+
+
+def _image_query_text_image_key_layout(
+    image_tokens: int,
+    text_tokens: int,
+    image_grid: Optional[TokenGrid],
+):
+    query_image = ModalityRange("image", 0, image_tokens, image_grid)
+    key_text = ModalityRange("text", 0, text_tokens, None)
+    key_image = ModalityRange("image", text_tokens, text_tokens + image_tokens, image_grid)
+    return make_layout([query_image], [key_text, key_image])
+
+
+def _apply_z_image_rotary(value, freqs_cis):
+    torch = require_torch()
+    with torch.amp.autocast("cuda", enabled=False):
+        complex_value = torch.view_as_complex(value.float().reshape(*value.shape[:-1], -1, 2))
+        rotated = torch.view_as_real(complex_value * freqs_cis.unsqueeze(2)).flatten(3)
+        return rotated.type_as(value)

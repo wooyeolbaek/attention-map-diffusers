@@ -1,11 +1,29 @@
 cff-version: 1.2.0
 title: "attention-map-diffusers"
-message: "If you find this software useful, please cite it as below."
+message: "If you use this software in research, please cite this archived release."
 type: software
 authors:
   - family-names: "Baek"
     given-names: "Wooyeol"
+    email: "wooyeol.baek@yonsei.ac.kr"
+    orcid: "https://orcid.org/0009-0006-9508-2660"
+  - family-names: "Baek"
+    given-names: "Seungyeol"
+    email: "mbaek01@korea.ac.kr"
+    orcid: "https://orcid.org/0009-0005-5322-888X"
+abstract: >-
+  A Python package for extracting and visualizing relation-aware text-to-text,
+  text-to-image, image-to-text, and image-to-image attention maps from Hugging
+  Face Diffusers image-generation pipelines.
+keywords:
+  - attention maps
+  - diffusion models
+  - diffusers
+  - interpretability
+  - text-to-image generation
 repository-code: "https://github.com/wooyeolbaek/attention-map-diffusers"
+url: "https://doi.org/10.5281/zenodo.18304023"
+doi: "10.5281/zenodo.18304023"
 license: MIT
-version: 0.1.5
-date-released: 2026-01-20
+version: 1.0.0
+date-released: 2026-07-31

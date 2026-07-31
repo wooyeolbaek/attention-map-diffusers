@@ -75,6 +75,11 @@ def main(argv: List[str] | None = None) -> int:
         help="Long side in pixels for spatial maps and overlays.",
     )
     parser.add_argument(
+        "--show-spatial-labels",
+        action="store_true",
+        help="Add a white title/token header to spatial maps and overlays; the default writes image-only PNGs.",
+    )
+    parser.add_argument(
         "--save-layer-maps",
         action="store_true",
         help="Also render every timestep/layer. Aggregate-only output is the faster default.",
@@ -229,7 +234,7 @@ def main(argv: List[str] | None = None) -> int:
                 max_map_elements=args.max_map_elements,
                 allow_large_maps=args.allow_large_maps,
             ) as capture:
-                result = pipe([prompt], **call_kwargs)
+                result = pipe(prompt=[prompt], **call_kwargs)
                 maps = capture.compute()
 
             model_dir = os.path.join(args.output_dir, key)
@@ -261,6 +266,8 @@ def main(argv: List[str] | None = None) -> int:
                     {
                         "model": key,
                         "model_id": config.model_id,
+                        "diffusers_version": diffusers.__version__,
+                        "torch_version": torch.__version__,
                         "prompt": prompt,
                         "seed": args.seed,
                         "steps": actual_steps,
@@ -279,6 +286,7 @@ def main(argv: List[str] | None = None) -> int:
                         "heads": selected_heads,
                         "max_visual_items": max_visual_items,
                         "spatial_long_side": args.spatial_long_side,
+                        "show_spatial_labels": args.show_spatial_labels,
                         "save_layer_maps": args.save_layer_maps,
                         "raw_tensors": args.save_raw,
                         "visualizations": not args.skip_visualization,
@@ -308,6 +316,7 @@ def main(argv: List[str] | None = None) -> int:
                         spatial_long_side=args.spatial_long_side,
                         max_items=max_visual_items,
                         save_layer_maps=args.save_layer_maps,
+                        show_spatial_labels=args.show_spatial_labels,
                     ),
                 )
             print(f"[{key}] ok: {maps.summary()}")

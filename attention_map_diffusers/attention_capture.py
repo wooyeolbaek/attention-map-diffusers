@@ -128,7 +128,10 @@ class AttentionCapture:
                     "Transformer2DModel",
                     "SD3Transformer2DModel",
                     "FluxTransformer2DModel",
+                    "Flux2Transformer2DModel",
                     "SanaTransformer2DModel",
+                    "ZImageTransformer2DModel",
+                    "PRXTransformer2DModel",
                 }:
                     self._register_context_hooks(module, f"{component_name}.{name}" if name else component_name)
 
@@ -178,7 +181,7 @@ def _context_from_forward(module, args, kwargs: Dict[str, Any], layer_id: str) -
     image_grid = None
     metadata = {"context_layer": layer_id, "context_class": class_name}
 
-    if class_name == "FluxTransformer2DModel":
+    if class_name in {"FluxTransformer2DModel", "Flux2Transformer2DModel"}:
         image_grid = infer_grid_from_img_ids(kwargs.get("img_ids"))
         if image_grid is None:
             image_grid = infer_grid_from_hidden_states(hidden_states)
@@ -187,6 +190,72 @@ def _context_from_forward(module, args, kwargs: Dict[str, Any], layer_id: str) -
             timestep=_to_float(timestep),
             image_grid=image_grid,
             image_tokens=_shape_dim(hidden_states, 1),
+            text_tokens=_shape_dim(encoder_hidden_states, 1),
+            metadata=metadata,
+        )
+
+    if class_name == "ZImageTransformer2DModel":
+        x = kwargs.get("x", hidden_states)
+        cap_feats = kwargs.get("cap_feats")
+        if cap_feats is None and len(args) > 2:
+            cap_feats = args[2]
+        patch_size = int(kwargs.get("patch_size", 2))
+        f_patch_size = int(kwargs.get("f_patch_size", 1))
+        image = x[0] if isinstance(x, (list, tuple)) and x else None
+        caption = cap_feats[0] if isinstance(cap_feats, (list, tuple)) and cap_feats else None
+        image_tokens = None
+        if image is not None and hasattr(image, "shape") and len(image.shape) == 4:
+            frames = int(image.shape[-3]) // f_patch_size
+            grid_height = int(image.shape[-2]) // patch_size
+            grid_width = int(image.shape[-1]) // patch_size
+            original_tokens = frames * grid_height * grid_width
+            image_tokens = original_tokens + (-original_tokens) % 32
+            # Padded tokens have no spatial position. Native generation sizes
+            # are divisible by 32; retain the grid only when it is exact.
+            if image_tokens == original_tokens:
+                from .capture.records import TokenGrid
+
+                image_grid = TokenGrid(
+                    frames=frames,
+                    height=grid_height,
+                    width=grid_width,
+                    patch_size=patch_size,
+                )
+        text_tokens = _shape_dim(caption, 0)
+        if text_tokens is not None:
+            text_tokens += (-text_tokens) % 32
+        if timestep is None:
+            timestep = kwargs.get("t")
+        if timestep is None and len(args) > 1:
+            timestep = args[1]
+        return CaptureRuntimeContext(
+            timestep=_to_float(timestep),
+            image_grid=image_grid,
+            image_tokens=image_tokens,
+            text_tokens=text_tokens,
+            metadata=metadata,
+        )
+
+    if class_name == "PRXTransformer2DModel":
+        if hidden_states is not None and hasattr(hidden_states, "shape") and len(hidden_states.shape) == 4:
+            from .capture.records import TokenGrid
+
+            patch_size = int(patch_size or getattr(module, "patch_size", 1))
+            grid_height = int(hidden_states.shape[-2]) // patch_size
+            grid_width = int(hidden_states.shape[-1]) // patch_size
+            image_grid = TokenGrid(
+                height=grid_height,
+                width=grid_width,
+                patch_size=patch_size,
+            )
+            image_tokens = grid_height * grid_width
+        else:
+            image_tokens = _shape_dim(hidden_states, 1)
+        encoder_hidden_states = kwargs.get("encoder_hidden_states")
+        return CaptureRuntimeContext(
+            timestep=_to_float(timestep),
+            image_grid=image_grid,
+            image_tokens=image_tokens,
             text_tokens=_shape_dim(encoder_hidden_states, 1),
             metadata=metadata,
         )

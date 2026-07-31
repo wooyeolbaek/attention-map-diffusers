@@ -1,136 +1,86 @@
 # attention-map-diffusers
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18304024.svg)](https://doi.org/10.5281/zenodo.18304024)
+Relation-aware attention visualization for Hugging Face Diffusers
+image-generation pipelines.
 
-[![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue)](https://huggingface.co/spaces/We-Want-GPU/diffusers-cross-attention-map-SDXL-t2i)
+[![PyPI](https://img.shields.io/pypi/v/attention-map-diffusers.svg)](https://pypi.org/project/attention-map-diffusers/)
+[![Python](https://img.shields.io/pypi/pyversions/attention-map-diffusers.svg)](https://pypi.org/project/attention-map-diffusers/)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18304023.svg)](https://doi.org/10.5281/zenodo.18304023)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Thanks to HuggingFace [Diffusers](https://github.com/huggingface/diffusers) team for the GPU sponsorship!
+## Visualization
 
-This repository is for extracting and visualizing cross attention maps, based on the latest [Diffusers](https://github.com/huggingface/diffusers) code (`v0.32.0`).
+Generated with [`black-forest-labs/FLUX.2-klein-4B`](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B)
+at 1024×1024, 4 steps, seed `2026`.
 
-For errors reports or feature requests, feel free to raise an issue.
+> Editorial wildlife photograph of a red fox wearing round glasses beside a
+> glowing blue lantern in a snowy pine forest at dusk.
 
-## Update Log.
-[2024-12-22] It is now compatible with _"Stable Diffusion 3.5"_, _"Flux-dev"_ and _"Flux-schnell"_! (“Sana" will be the focus of the next update.)
+![FLUX.2 Klein generated red fox](./assets/examples/flux2-klein-generated.png)
 
-[2024-12-17] Refactor and add setup.py
+| text→text | text→image · query token `lantern` |
+| :---: | :---: |
+| ![FLUX.2 Klein text-to-text attention matrix](./assets/examples/flux2-klein-text-text.png) | ![FLUX.2 Klein text-to-image attention for lantern](./assets/examples/flux2-klein-text-image-lantern.png) |
+| **image→text · key token `lantern`** | **image→image · center query patch** |
+| ![FLUX.2 Klein image-to-text attention for lantern](./assets/examples/flux2-klein-image-text-lantern.png) | ![FLUX.2 Klein image-to-image attention for the center patch](./assets/examples/flux2-klein-image-image-center.png) |
 
-[2024-11-12] _"Stable Diffusion 3"_ is compatible and supports _batch operations_! (Flux and "Stable Diffusion 3.5" is not compatible yet.)
+Attention is averaged across heads and 25 layers at denoising timestep
+`0.96875` (step 2 of 4). Spatial maps are image-only overlays by default;
+map-only PNGs are saved alongside them.
 
-[2024-07-04] Added features for _saving attention maps based on timesteps and layers_.
+| Relation | Visualization |
+| --- | --- |
+| `text→text` | Token matrix with query tokens on y and key tokens on x |
+| `text→image` | Image-shaped heatmap for each query token |
+| `image→text` | Image-shaped heatmap for each key token |
+| `image→image` | Key-patch heatmap for every selected query patch |
 
+## Compatible models
 
-## Compatible models.
-<!-- Compatible with various models, including both UNet/DiT based models listed below. -->
-Compatible with various models listed below.
-- [black-forest-labs/FLUX.1-schnell](https://huggingface.co/black-forest-labs/FLUX.1-schnell)
-- [black-forest-labs/FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev)
-- [stabilityai/stable-diffusion-3.5-medium](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium)
-- [stabilityai/stable-diffusion-3-medium-diffusers](https://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers)
-- [stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0)
-- [stable-diffusion-2-1-base](https://huggingface.co/stabilityai/stable-diffusion-2-1-base)
-- ...
+Requires `diffusers>=0.39.0`.
 
-<!-- - [sdxl-turbo](https://huggingface.co/stabilityai/sdxl-turbo) -->
-<!-- - [black-forest-labs/FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) -->
+| Demo key | Diffusers checkpoint | Relations |
+| --- | --- | --- |
+| `flux2-klein` | [`black-forest-labs/FLUX.2-klein-4B`](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | All four |
+| `z-image-turbo` | [`Tongyi-MAI/Z-Image-Turbo`](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | All four |
+| `prx-pixel` | [`Photoroom/prxpixel-t2i`](https://huggingface.co/Photoroom/prxpixel-t2i) | `image→text`, `image→image` |
+| `flux-schnell` | [`black-forest-labs/FLUX.1-schnell`](https://huggingface.co/black-forest-labs/FLUX.1-schnell) | All four |
+| `flux-dev` | [`black-forest-labs/FLUX.1-dev`](https://huggingface.co/black-forest-labs/FLUX.1-dev) | All four |
+| `sd3-5` | [`stabilityai/stable-diffusion-3.5-medium`](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium) | All four |
+| `sd3` | [`stabilityai/stable-diffusion-3-medium-diffusers`](https://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers) | All four |
+| `sana` | [`Efficient-Large-Model/Sana_1600M_1024px_diffusers`](https://huggingface.co/Efficient-Large-Model/Sana_1600M_1024px_diffusers) | `image→text`, `image→image` |
+| `sdxl` | [`stabilityai/stable-diffusion-xl-base-1.0`](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) | `image→text`, `image→image` |
+| `sd` | [`sd2-community/stable-diffusion-2-1`](https://huggingface.co/sd2-community/stable-diffusion-2-1) | `image→text`, `image→image` |
 
+“All four” means `text→text`, `text→image`, `image→text`, and `image→image`.
 
-## Example.
+## Install
 
+```bash
+pip install --upgrade attention-map-diffusers
+```
 
-<div style="text-align: center;">
-    <img src="./assets/sd3.png" alt="Image 1" width="400" height="400">
-    <img src="./assets/4--bara>.png" alt="Image 2" width="400" height="400">
-</div>
+For demos and validators:
 
-
-
-<details>
-<summary>cap-</summary>
-<div markdown="1">
-
-<div style="text-align: center;">
-    <img src="./assets/sd3.png" alt="Image 1" width="400" height="400">
-    <img src="./assets/2-<cap-.png" alt="<cap-" width="400" height="400">
-</div>
-
-</div>
-</details>
-
-
-<details>
-<summary>-y-</summary>
-<div markdown="1">
-
-<div style="text-align: center;">
-    <img src="./assets/sd3.png" alt="Image 1" width="400" height="400">
-    <img src="./assets/3--y-.png" alt="-y-" width="400" height="400">
-</div>
-
-</div>
-</details>
-
-
-<details>
-<summary>-bara</summary>
-<div markdown="1">
-
-<div style="text-align: center;">
-    <img src="./assets/sd3.png" alt="Image 1" width="400" height="400">
-    <img src="./assets/4--bara>.png" alt="-bara>" width="400" height="400">
-</div>
-
-</div>
-</details>
-
-
-<details>
-<summary>hello</summary>
-<div markdown="1">
-
-<div style="text-align: center;">
-    <img src="./assets/sd3.png" alt="Image 1" width="400" height="400">
-    <img src="./assets/10-<hello>.png" alt="<hello>" width="400" height="400">
-</div>
-
-</div>
-</details>
-
-
-<details>
-<summary>world</summary>
-<div markdown="1">
-
-<div style="text-align: center;">
-    <img src="./assets/sd3.png" alt="Image 1" width="400" height="400">
-    <img src="./assets/11-<world>.png" alt="<world>>" width="400" height="400">
-</div>
-
-</div>
-</details>
-
-
-
-## demo
 ```bash
 git clone https://github.com/wooyeolBaek/attention-map-diffusers.git
 cd attention-map-diffusers
 pip install -e .
 ```
-or
-```bash
-pip install attention_map_diffusers
-```
 
-### Relation-aware capture and visualization API
+## Quick start
+
 ```python
 import torch
-from diffusers import FluxPipeline
+from diffusers import Flux2KleinPipeline
 from attention_map_diffusers import AttentionCapture, VisualizationConfig
 
-prompt = "A capybara holding a sign that reads Hello World."
-pipe = FluxPipeline.from_pretrained(
-    "black-forest-labs/FLUX.1-schnell",
+prompt = (
+    "Editorial wildlife photograph of a red fox wearing round glasses beside "
+    "a glowing blue lantern in a snowy pine forest at dusk."
+)
+pipe = Flux2KleinPipeline.from_pretrained(
+    "black-forest-labs/FLUX.2-klein-4B",
     torch_dtype=torch.bfloat16,
 ).to("cuda")
 
@@ -139,365 +89,92 @@ with AttentionCapture(
     relations=["text->text", "text->image", "image->text", "image->image"],
     mode="fast",
     heads="mean",
-    offload="cuda",  # fastest when enough VRAM is available
-    # image->image keeps every query/key patch by default, producing one
-    # key-patch-grid heatmap for every query patch.
+    offload="cuda",
 ) as capture:
-    images = pipe([prompt], num_inference_steps=4).images
+    images = pipe(
+        prompt=[prompt],
+        num_inference_steps=4,
+        guidance_scale=1.0,
+    ).images
 
 maps = capture.compute()
 maps.save(
-    "outputs/flux-schnell/attention",
-    tokenizer=pipe.tokenizer_2,  # Flux attends to T5 tokens
+    "outputs/attention",
+    tokenizer=pipe.tokenizer,
     prompts=[prompt],
-    images=images,               # also writes heatmap overlays
+    images=images,
     visualization_config=VisualizationConfig(),
 )
 ```
 
-The renderer selects the visualization from the relation metadata:
+Or use the shared model runner:
 
-- `text->text`: one attention matrix with query tokens on the y-axis and key
-  tokens on the x-axis. Padding tokens are omitted.
-- `image->text`: one image-shaped heatmap per key token.
-- `text->image`: one image-shaped heatmap per query token.
-- `image->image`: one key-patch-grid heatmap per selected query patch. If only
-  key patches were selected, it renders the inverse received-attention view.
+```bash
+python demo/run_attention_demo.py \
+  --model flux2-klein \
+  --relations all \
+  --mode fast \
+  --offload cuda
+```
 
-Each relation is organized as follows:
+## Output
 
 ```text
-attention/
+outputs/
   metadata.json
-  raw/<relation>/*.pt              # when save_raw=True / --save-raw
+  raw/<relation>/*.pt                    # optional
   visuals/<relation>/
     aggregate/batch-000/
-      maps/*.png                  # pure attention maps
-      overlays/*.png              # generated-image overlays
-                                  # (only for spatial maps with images=...)
-    steps/<timestep>/<layer>/     # when --save-layer-maps is enabled
-    aggregate/overview-batch-000.png
+      maps/*.png
+      overlays/*.png
+    steps/<timestep>/<layer>/            # optional
 ```
 
-SD3/SD3.5 and Flux joint attention support all four relations. SD/SDXL and
-Sana expose `image->text` cross-attention and `image->image` self-attention.
-For SD3 use `tokenizer_3`; for Flux use `tokenizer_2`; the shared demo runner
-selects this automatically.
+- All image query/key patches are retained by default. Use
+  `--large-relation-query-indices sample:9` to limit image→image outputs.
+- Aggregate attention is saved by default. Add `--capture-timesteps all` and
+  `--save-layer-maps` for every timestep and layer.
+- Use `--heads mean`, `--heads all`, or a selection such as `--heads 0,2`.
+- Raw `.pt` tensors are not required for visualization and are only written
+  with `--save-raw`.
+- Maps and generated-image overlays are stored in separate directories.
+- Spatial PNGs contain only the image by default. Use `--show-spatial-labels`
+  or `VisualizationConfig(show_spatial_labels=True)` to add token/patch titles.
 
-The model demos share one runner and support relation-level execution:
+See every runner option with:
 
 ```bash
-python demo/run_attention_demo.py --model all --relations all --mode fast --offload cuda
-python demo/demo-sd.py --dry-run
-python demo/demo-flux-dev.py --relations 'image->text,text->image'
+python demo/run_attention_demo.py --help
 ```
 
-By default, demos keep every image query/key patch and write one `image->image`
-map per query patch. Use `--large-relation-query-indices center` or `sample:9`
-only when a smaller diagnostic subset is intentional. All token/patch visuals
-are also written by default; `--max-visual-items N` explicitly caps them. The
-runner saves aggregate visuals by default. Raw `.pt` tensors are not needed for
-PNG rendering and are opt-in through `--save-raw`; save them only for later
-offline numerical analysis or re-rendering. Add `--save-layer-maps` for every
-layer/timestep. `--heads mean` averages heads, `--heads all` retains them all,
-and a comma list such as `--heads 0,2` retains selected heads. `--steps 1` is
-useful only for a smoke test and intentionally produces low-quality images.
+## Validation
 
-The runner uses seed `0` by default and records the effective seed, step count,
-resolution, generated PNG dimensions, and relations in each model's
-`run-config.json`. It warns when `--steps` or an explicit resolution is below
-that model's recommended default. Demos retain the final denoising timestep's
-attention by default so full patch maps stay bounded while the model still runs
-all recommended generation steps; pass `--capture-timesteps all` only when the
-whole denoising trajectory is required. To verify that capture is
-generation-neutral on real model weights, run:
+All ten model integrations were tested on real weights across capture modes,
+relations, timesteps, layers, heads, patch selections, raw output, PNG
+integrity, and generation parity.
 
 ```bash
+pytest -q
 python demo/validate_generation_parity.py --model all
-```
-
-Every demo also writes `tensor-validation.json` directly from the in-memory
-attention tensors, so finite values and normalization can be audited without
-storing `.pt` files. Use `--skip-visualization` for a fast numerical-only run.
-Combining it with `--save-raw` skips PNG rendering and VAE decoding while still
-writing metadata and the explicitly requested `.pt` tensors.
-
-To validate a completed native-resolution model/relation matrix, including
-query-patch continuity, map/overlay parity, PNG integrity, generated image
-sizes, and optional in-memory tensor reports:
-
-```bash
-python demo/validate_full_matrix_run.py demo-outputs \
-  --tensor-validation-dir tensor-validation-outputs
-```
-
-To audit a per-model option-coverage matrix, including `fast`/`exact`/`stream`
-pixel parity, all-timestep/layer output counts, raw tensor loading, selected
-query/key/head behavior, PNG integrity, and the map-size safety guard:
-
-```bash
 python demo/validate_option_matrix.py option-matrix-outputs
 ```
 
-To audit a completed all-model run (raw tensor shapes, finite values,
-normalization, aggregate coverage, CFG filtering, and PNG integrity):
+## Citation
 
-```bash
-python demo/validate_attention_outputs.py demo-outputs
-```
-
-### Flux-dev
-```python
-import torch
-from diffusers import FluxPipeline
-from attention_map_diffusers import (
-    attn_maps,
-    init_pipeline,
-    save_attention_maps
-)
-
-pipe = FluxPipeline.from_pretrained(
-    "black-forest-labs/FLUX.1-dev",
-    torch_dtype=torch.bfloat16
-)
-# pipe.enable_model_cpu_offload() #save some VRAM by offloading the model to CPU. Remove this if you have enough GPU power
-pipe.to('cuda')
-
-##### 1. Replace modules and Register hook #####
-pipe = init_pipeline(pipe)
-################################################
-
-# recommend not using batch operations for sd3, as cpu memory could be exceeded.
-prompts = [
-    # "A photo of a puppy wearing a hat.",
-    "A capybara holding a sign that reads Hello World.",
-]
-
-images = pipe(
-    prompts,
-    num_inference_steps=15,
-    guidance_scale=4.5,
-).images
-
-for batch, image in enumerate(images):
-    image.save(f'{batch}-flux-dev.png')
-
-##### 2. Process and Save attention map #####
-save_attention_maps(attn_maps, pipe.tokenizer, prompts, base_dir='attn_maps-flux-dev', unconditional=False)
-#############################################
-```
-
-### Flux-schnell
-```python
-import torch
-from diffusers import FluxPipeline
-from attention_map_diffusers import (
-    attn_maps,
-    init_pipeline,
-    save_attention_maps
-)
-
-pipe = FluxPipeline.from_pretrained(
-    "black-forest-labs/FLUX.1-schnell",
-    torch_dtype=torch.bfloat16
-)
-# pipe.enable_model_cpu_offload() #save some VRAM by offloading the model to CPU. Remove this if you have enough GPU power
-pipe.to('cuda')
-
-##### 1. Replace modules and Register hook #####
-pipe = init_pipeline(pipe)
-################################################
-
-# recommend not using batch operations for sd3, as cpu memory could be exceeded.
-prompts = [
-    # "A photo of a puppy wearing a hat.",
-    "A capybara holding a sign that reads Hello World.",
-]
-
-images = pipe(
-    prompts,
-    num_inference_steps=15,
-    guidance_scale=4.5,
-).images
-
-for batch, image in enumerate(images):
-    image.save(f'{batch}-flux-schnell.png')
-
-##### 2. Process and Save attention map #####
-save_attention_maps(attn_maps, pipe.tokenizer, prompts, base_dir='attn_maps-flux-schnell', unconditional=False)
-#############################################
-```
-
-### Stable Diffusion 3.5
-```python
-import torch
-from diffusers import StableDiffusion3Pipeline
-from attention_map_diffusers import (
-    attn_maps,
-    init_pipeline,
-    save_attention_maps
-)
-
-pipe = StableDiffusion3Pipeline.from_pretrained(
-    "stabilityai/stable-diffusion-3.5-medium",
-    torch_dtype=torch.bfloat16
-)
-pipe = pipe.to("cuda")
-
-##### 1. Replace modules and Register hook #####
-pipe = init_pipeline(pipe)
-################################################
-
-# recommend not using batch operations for sd3, as cpu memory could be exceeded.
-prompts = [
-    # "A photo of a puppy wearing a hat.",
-    "A capybara holding a sign that reads Hello World.",
-]
-
-images = pipe(
-    prompts,
-    num_inference_steps=15,
-    guidance_scale=4.5,
-).images
-
-for batch, image in enumerate(images):
-    image.save(f'{batch}-sd3-5.png')
-
-##### 2. Process and Save attention map #####
-save_attention_maps(attn_maps, pipe.tokenizer, prompts, base_dir='attn_maps-sd3-5', unconditional=True)
-#############################################
-```
-
-### Stable Diffusion 3.0
-```python
-import torch
-from diffusers import StableDiffusion3Pipeline
-from attention_map_diffusers import (
-    attn_maps,
-    init_pipeline,
-    save_attention_maps
-)
-
-
-pipe = StableDiffusion3Pipeline.from_pretrained(
-    "stabilityai/stable-diffusion-3-medium-diffusers",
-    torch_dtype=torch.bfloat16
-)
-pipe = pipe.to("cuda")
-
-##### 1. Replace modules and Register hook #####
-pipe = init_pipeline(pipe)
-################################################
-
-# recommend not using batch operations for sd3, as cpu memory could be exceeded.
-prompts = [
-    # "A photo of a puppy wearing a hat.",
-    "A capybara holding a sign that reads Hello World.",
-]
-
-images = pipe(
-    prompts,
-    num_inference_steps=15,
-    guidance_scale=4.5,
-).images
-
-for batch, image in enumerate(images):
-    image.save(f'{batch}-sd3.png')
-
-##### 2. Process and Save attention map #####
-save_attention_maps(attn_maps, pipe.tokenizer, prompts, base_dir='attn_maps', unconditional=True)
-#############################################
-```
-
-### Stable Diffusion XL
-```python
-import torch
-from diffusers import DiffusionPipeline
-from attention_map_diffusers import (
-    attn_maps,
-    init_pipeline,
-    save_attention_maps
-)
-
-
-pipe = DiffusionPipeline.from_pretrained(
-    "stabilityai/stable-diffusion-xl-base-1.0",
-    torch_dtype=torch.float16,
-)
-pipe = pipe.to("cuda")
-
-##### 1. Replace modules and Register hook #####
-pipe = init_pipeline(pipe)
-################################################
-
-prompts = [
-    "A photo of a puppy wearing a hat.",
-    "A capybara holding a sign that reads Hello World.",
-]
-
-images = pipe(
-    prompts,
-    num_inference_steps=15,
-).images
-
-for batch, image in enumerate(images):
-    image.save(f'{batch}-sdxl.png')
-
-##### 2. Process and Save attention map #####
-save_attention_maps(attn_maps, pipe.tokenizer, prompts, base_dir='attn_maps', unconditional=True)
-#############################################
-```
-
-### Stable Diffusion 2.1
-```python
-import torch
-from diffusers import DiffusionPipeline
-from attention_map_diffusers import (
-    attn_maps,
-    init_pipeline,
-    save_attention_maps
-)
-
-
-pipe = DiffusionPipeline.from_pretrained(
-    "stabilityai/stable-diffusion-2-1",
-    torch_dtype=torch.float16,
-)
-pipe = pipe.to("cuda")
-
-##### 1. Replace modules and Register hook #####
-pipe = init_pipeline(pipe)
-################################################
-
-prompts = [
-    "A photo of a puppy wearing a hat.",
-    "A capybara holding a sign that reads Hello World.",
-]
-
-images = pipe(
-    prompts,
-    num_inference_steps=15,
-).images
-
-for batch, image in enumerate(images):
-    image.save(f'{batch}-sd2-1.png')
-
-##### 2. Process and Save attention map #####
-save_attention_maps(attn_maps, pipe.tokenizer, prompts, base_dir='attn_maps', unconditional=True)
-#############################################
-
-```
-
-# Citation
-If you find this code useful in your research, please consider citing:
-
-```
-@misc{baek2024attentionmap,
-  author = {Wooyeol Baek},
+```bibtex
+@software{baek_attention_map_diffusers_2026,
+  author = {Baek, Wooyeol and Baek, Seungyeol},
   title = {attention-map-diffusers},
-  year = {2023},
-  publisher = {GitHub},
-  journal = {GitHub repository},
-  howpublished = {\url{[https://github.com/wooyeolbaek/attention-map-diffusers](https://github.com/wooyeolbaek/attention-map-diffusers)}},
+  version = {1.0.0},
+  year = {2026},
+  publisher = {Zenodo},
+  doi = {10.5281/zenodo.18304023},
+  url = {https://doi.org/10.5281/zenodo.18304023}
 }
 ```
+
+See [`CITATION.cff`](CITATION.cff) for machine-readable citation metadata.
+
+## License
+
+[MIT](LICENSE)

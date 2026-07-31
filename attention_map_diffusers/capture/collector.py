@@ -143,7 +143,9 @@ class AttentionCollector:
             else:
                 q_store = tensor_to_device(q_store, self.config.offload, self.config.dtype)
                 k_store = tensor_to_device(key, self.config.offload, self.config.dtype)
-                relation_mask = tensor_to_device(relation_mask, self.config.offload, self.config.dtype)
+                # Preserve boolean SDPA masks even when captured Q/K tensors
+                # are explicitly cast to another storage dtype.
+                relation_mask = tensor_to_device(relation_mask, self.config.offload)
 
             record_metadata = dict(metadata)
             if query_indices is not None:
@@ -304,27 +306,27 @@ class AttentionMaps:
             "image_query_max_error": 0.0,
             "text_query_max_error": 0.0,
         }
-        required = {"image->image", "image->text", "text->image", "text->text"}
         for group in joint_groups.values():
-            if not required.issubset(group):
-                continue
-            if not all(group[relation]["keys_complete"] for relation in required):
-                joint_stats["skipped_partial_key_groups"] += 1
-                continue
-            image_pair = _aligned_query_masses(group["image->image"], group["image->text"])
-            text_pair = _aligned_query_masses(group["text->image"], group["text->text"])
-            if image_pair is None or text_pair is None:
-                joint_stats["skipped_disjoint_query_groups"] += 1
-                continue
-            image_error = float((image_pair[0] + image_pair[1] - 1.0).abs().max())
-            text_error = float((text_pair[0] + text_pair[1] - 1.0).abs().max())
-            joint_stats["groups"] += 1
-            joint_stats["image_query_max_error"] = max(
-                joint_stats["image_query_max_error"], image_error
-            )
-            joint_stats["text_query_max_error"] = max(
-                joint_stats["text_query_max_error"], text_error
-            )
+            evaluated = False
+            for query_name, left_relation, right_relation in (
+                ("image", "image->image", "image->text"),
+                ("text", "text->image", "text->text"),
+            ):
+                if left_relation not in group or right_relation not in group:
+                    continue
+                if not group[left_relation]["keys_complete"] or not group[right_relation]["keys_complete"]:
+                    joint_stats["skipped_partial_key_groups"] += 1
+                    continue
+                pair = _aligned_query_masses(group[left_relation], group[right_relation])
+                if pair is None:
+                    joint_stats["skipped_disjoint_query_groups"] += 1
+                    continue
+                error = float((pair[0] + pair[1] - 1.0).abs().max())
+                stat_name = f"{query_name}_query_max_error"
+                joint_stats[stat_name] = max(joint_stats[stat_name], error)
+                evaluated = True
+            if evaluated:
+                joint_stats["groups"] += 1
         if joint_stats["image_query_max_error"] > tolerance:
             issues.append(f"joint image-query normalization error {joint_stats['image_query_max_error']}")
         if joint_stats["text_query_max_error"] > tolerance:

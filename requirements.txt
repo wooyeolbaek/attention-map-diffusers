@@ -1,7 +1,10 @@
-diffusers>=0.29.0
+diffusers>=0.39.0
 accelerate
-transformers
-einops
+transformers>=4.57.0
+ftfy
+numpy
+Pillow
+torch>=2.0.0
 torchvision
 protobuf
 sentencepiece

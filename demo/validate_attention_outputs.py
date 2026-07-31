@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, Tuple
 import torch
 from PIL import Image
 
-from common import MODEL_CONFIGS
+from common import MODEL_CONFIGS, model_keys
 
 
 def validate_model(model_dir: Path, expected_relations: Iterable[str]) -> Dict[str, Any]:
@@ -221,10 +221,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Validate raw and rendered attention-map demo outputs.")
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--report", type=Path, default=None)
+    parser.add_argument("--model", default="all", help="Model key, comma-list, or 'all'.")
     args = parser.parse_args()
 
     report = {"models": {}, "status": "pass"}
-    for model, config in MODEL_CONFIGS.items():
+    for model in model_keys(args.model):
+        config = MODEL_CONFIGS[model]
         result = validate_model(args.output_dir / model, config.relations)
         report["models"][model] = result
         if result["status"] != "pass":

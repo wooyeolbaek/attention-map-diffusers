@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from common import MODEL_CONFIGS
+from common import MODEL_CONFIGS, model_keys
 
 
 PATCH_PATTERN = re.compile(r"query-patch-(\d+)-y(\d+)-x(\d+)\.png$")
@@ -156,6 +156,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Validate a full model/relation visualization matrix.")
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--report", type=Path, default=None)
+    parser.add_argument("--model", default="all", help="Model key, comma-list, or 'all'.")
     parser.add_argument(
         "--tensor-validation-dir",
         type=Path,
@@ -165,7 +166,7 @@ def main() -> int:
     args = parser.parse_args()
 
     report = {"status": "pass", "models": {}}
-    for key in MODEL_CONFIGS:
+    for key in model_keys(args.model):
         result = validate_model(args.output_dir / key, key)
         if args.tensor_validation_dir is not None:
             tensor_path = args.tensor_validation_dir / key / "tensor-validation.json"

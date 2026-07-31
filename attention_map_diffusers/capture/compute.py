@@ -38,7 +38,17 @@ def compute_attention_probs(
         end = min(start + chunk_size, query.shape[-2])
         logits = torch.matmul(query[:, :, start:end].float(), key_t) * scale_factor
         if attention_mask is not None:
-            logits = logits + attention_mask[..., start:end, :]
+            mask = (
+                attention_mask
+                if attention_mask.shape[-2] == 1
+                else attention_mask[..., start:end, :]
+            )
+            if mask.dtype == torch.bool:
+                # SDPA uses True for key positions that participate in
+                # attention; adding a bool mask as 1/0 would invert its role.
+                logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+            else:
+                logits = logits + mask
         probabilities = torch.softmax(logits, dim=-1).to(query.dtype)
         if output_key_index is not None:
             probabilities = probabilities.index_select(-1, output_key_index)

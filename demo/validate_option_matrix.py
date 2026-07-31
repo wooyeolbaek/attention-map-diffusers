@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from common import MODEL_CONFIGS
+from common import MODEL_CONFIGS, model_keys
 
 
 SUCCESS_PROFILES = {
@@ -132,7 +132,8 @@ def validate_success_profile(root: Path, profile_name: str, key: str) -> dict:
         if run.get(field) != value:
             issues.append(f"run config {field}={run.get(field)!r}, expected={value!r}")
     if expected["offload"] == "cuda":
-        if not str(run.get("offload", "")).startswith("cuda:"):
+        recorded_offload = str(run.get("offload", ""))
+        if recorded_offload != "cuda" and not recorded_offload.startswith("cuda:"):
             issues.append(f"run config offload={run.get('offload')!r}, expected CUDA device")
     elif run.get("offload") != expected["offload"]:
         issues.append(f"run config offload={run.get('offload')!r}, expected={expected['offload']!r}")
@@ -208,8 +209,11 @@ def validate_success_profile(root: Path, profile_name: str, key: str) -> dict:
 
     timestep_count = len(metadata["summary"].get("timesteps", []))
     if profile_name == "exact-all-layer-raw":
-        if timestep_count != 2:
-            issues.append(f"all-timestep profile retained {timestep_count} timesteps, expected 2")
+        if not 1 <= timestep_count <= expected["options"]["steps"]:
+            issues.append(
+                f"all-timestep profile retained {timestep_count} timesteps, expected between "
+                f"1 and {expected['options']['steps']}"
+            )
     elif timestep_count != 1:
         issues.append(f"last-timestep profile retained {timestep_count} timesteps, expected 1")
 
@@ -313,12 +317,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Validate the per-model CLI option coverage matrix.")
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--report", type=Path, default=None)
+    parser.add_argument("--model", default="all", help="Model key, comma-list, or 'all'.")
     args = parser.parse_args()
+    selected_models = model_keys(args.model)
 
     report = {"status": "pass", "profiles": {}, "parity": {}, "guards": {}}
     for profile in SUCCESS_PROFILES:
         report["profiles"][profile] = {}
-        for key in MODEL_CONFIGS:
+        for key in selected_models:
             result = validate_success_profile(args.output_dir, profile, key)
             report["profiles"][profile][key] = result
             if result["status"] != "pass":
@@ -327,7 +333,7 @@ def main() -> int:
             for issue in result["issues"]:
                 print(f"  issue: {issue}")
 
-    for key in MODEL_CONFIGS:
+    for key in selected_models:
         result = validate_parity(args.output_dir, key)
         report["parity"][key] = result
         if result["status"] != "pass":

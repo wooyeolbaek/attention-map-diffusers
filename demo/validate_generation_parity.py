@@ -55,7 +55,7 @@ def main() -> int:
 
             prompt = config.prompt
             baseline = pipe(
-                [prompt], generator=_generator(torch, args.device, args.seed), **call_kwargs
+                prompt=[prompt], generator=_generator(torch, args.device, args.seed), **call_kwargs
             ).images.detach().float()
 
             with AttentionCapture(
@@ -68,7 +68,7 @@ def main() -> int:
                 relation_key_indices={"image->text": (0,)},
             ) as capture:
                 captured = pipe(
-                    [prompt], generator=_generator(torch, args.device, args.seed), **call_kwargs
+                    prompt=[prompt], generator=_generator(torch, args.device, args.seed), **call_kwargs
                 ).images.detach().float()
 
             difference = (baseline - captured).abs()

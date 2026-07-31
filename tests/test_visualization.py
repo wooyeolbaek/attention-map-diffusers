@@ -54,6 +54,7 @@ class VisualizationTests(unittest.TestCase):
         config = VisualizationConfig()
         self.assertIsNone(config.max_items)
         self.assertFalse(config.save_layer_maps)
+        self.assertFalse(config.show_spatial_labels)
         self.assertEqual(CaptureConfig().max_map_elements, 128_000_000)
 
     def test_last_timestep_mode_discards_earlier_records(self):
@@ -87,7 +88,43 @@ class VisualizationTests(unittest.TestCase):
                 (Path(directory) / "image-to-image/aggregate/batch-000/overlays").glob("*.png")
             )
             with Image.open(overlay) as image:
-                self.assertEqual(image.width, 48)
+                self.assertEqual(image.size, (48, 24))
+
+    def test_spatial_labels_are_opt_in(self):
+        grid = TokenGrid(height=2, width=2)
+        record = make_record("image->image", torch.rand(1, 1, 4, 4), q_grid=grid, k_grid=grid)
+        source = Image.new("RGB", (80, 40), "white")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            AttentionVisualizer(VisualizationConfig(spatial_long_side=48, max_items=1)).save(
+                [record], root / "plain", images=[source]
+            )
+            AttentionVisualizer(
+                VisualizationConfig(
+                    spatial_long_side=48,
+                    max_items=1,
+                    show_spatial_labels=True,
+                )
+            ).save([record], root / "labelled", images=[source])
+
+            plain_map = next((root / "plain/image-to-image/aggregate/batch-000/maps").glob("*.png"))
+            plain_overlay = next(
+                (root / "plain/image-to-image/aggregate/batch-000/overlays").glob("*.png")
+            )
+            labelled_map = next(
+                (root / "labelled/image-to-image/aggregate/batch-000/maps").glob("*.png")
+            )
+            labelled_overlay = next(
+                (root / "labelled/image-to-image/aggregate/batch-000/overlays").glob("*.png")
+            )
+            with Image.open(plain_map) as image:
+                self.assertEqual(image.size, (48, 48))
+            with Image.open(plain_overlay) as image:
+                self.assertEqual(image.size, (48, 24))
+            with Image.open(labelled_map) as image:
+                self.assertGreater(image.height, 48)
+            with Image.open(labelled_overlay) as image:
+                self.assertGreater(image.height, 24)
 
     def test_all_four_relations_are_rendered(self):
         grid = TokenGrid(height=2, width=3)
@@ -226,6 +263,42 @@ class CaptureComputeTests(unittest.TestCase):
         )
         self.assertEqual(tuple(actual.shape), (2, 1, 7, 5))
         torch.testing.assert_close(actual, expected)
+
+    def test_boolean_attention_mask_uses_sdpa_semantics(self):
+        torch.manual_seed(41)
+        query = torch.randn(1, 2, 4, 8)
+        key = torch.randn(1, 2, 5, 8)
+        mask = torch.tensor([[[[True, True, False, True, False]]]])
+        actual = compute_attention_probs(query, key, attention_mask=mask, chunk_size=2, heads="all")
+        logits = torch.matmul(query.float(), key.float().transpose(-2, -1)) * (8**-0.5)
+        expected = torch.softmax(logits.masked_fill(~mask, torch.finfo(logits.dtype).min), dim=-1)
+        torch.testing.assert_close(actual, expected)
+        self.assertTrue(torch.equal(actual[..., 2], torch.zeros_like(actual[..., 2])))
+        self.assertTrue(torch.equal(actual[..., 4], torch.zeros_like(actual[..., 4])))
+
+    def test_fast_capture_preserves_boolean_mask_when_qk_are_cast(self):
+        query = torch.randn(1, 1, 4, 8)
+        image = ModalityRange("image", 0, 4, TokenGrid(height=2, width=2))
+        mask = torch.tensor([[[[True, True, False, True]]]])
+        collector = AttentionCollector(
+            CaptureConfig(
+                relations=["image->image"],
+                mode="fast",
+                offload="cpu",
+                dtype="float16",
+            )
+        )
+        collector.capture_qk(
+            layer_id="masked",
+            attention_type="self",
+            query=query,
+            key=query,
+            layout=make_layout([image], [image]),
+            attention_mask=mask,
+        )
+        self.assertEqual(collector.records[0].attention_mask.dtype, torch.bool)
+        data = collector.compute().records[0].data
+        self.assertTrue(torch.equal(data[..., 2], torch.zeros_like(data[..., 2])))
 
     def test_dynamic_patch_selection(self):
         self.assertEqual(normalize_indices("center", 9), (4,))

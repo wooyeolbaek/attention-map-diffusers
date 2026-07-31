@@ -17,7 +17,9 @@ class VisualizationConfig:
 
     ``max_items`` only limits the number of PNGs written for a single record;
     it never changes the captured tensor or the aggregate. Text padding tokens
-    are hidden automatically when a tokenizer is available.
+    are hidden automatically when a tokenizer is available. Spatial maps and
+    overlays contain only the image by default; set ``show_spatial_labels`` to
+    add the token/patch title and patch-grid annotation.
     """
 
     spatial_long_side: int = 512
@@ -29,6 +31,7 @@ class VisualizationConfig:
     save_layer_maps: bool = False
     save_aggregate: bool = True
     save_overlays: bool = True
+    show_spatial_labels: bool = False
     max_matrix_tokens: Optional[int] = 128
 
     def __post_init__(self) -> None:
@@ -257,6 +260,7 @@ class AttentionVisualizer:
             title,
             colormap=self.config.colormap,
             long_side=self.config.spatial_long_side,
+            show_labels=self.config.show_spatial_labels,
         )
         heatmap_path = map_dir / f"{stem}.png"
         heatmap.save(heatmap_path)
@@ -271,6 +275,7 @@ class AttentionVisualizer:
                 title,
                 self.config.overlay_alpha,
                 self.config.spatial_long_side,
+                self.config.show_spatial_labels,
             )
             overlay_path = overlay_dir / f"{stem}.png"
             overlay.save(overlay_path)
@@ -547,7 +552,14 @@ def _render_text_matrix(matrix, query_labels, key_labels, title: str, colormap: 
     return canvas
 
 
-def _render_spatial_map(spatial, title: str, *, colormap: str, long_side: int):
+def _render_spatial_map(
+    spatial,
+    title: str,
+    *,
+    colormap: str,
+    long_side: int,
+    show_labels: bool,
+):
     from PIL import Image, ImageDraw
 
     grid_h, grid_w = int(spatial.shape[-2]), int(spatial.shape[-1])
@@ -558,6 +570,9 @@ def _render_spatial_map(spatial, title: str, *, colormap: str, long_side: int):
         width = long_side
         height = max(1, round(long_side * grid_h / grid_w))
     raw = _colorize(spatial, colormap).resize((width, height), Image.Resampling.NEAREST)
+    if not show_labels:
+        return raw, raw
+
     title_lines = title.splitlines()
     header = 20 + 19 * len(title_lines)
     canvas = Image.new("RGB", (width, height + header + 25), "white")
@@ -569,7 +584,14 @@ def _render_spatial_map(spatial, title: str, *, colormap: str, long_side: int):
     return canvas, raw
 
 
-def _render_overlay(source, heatmap, title: str, alpha: float, long_side: int):
+def _render_overlay(
+    source,
+    heatmap,
+    title: str,
+    alpha: float,
+    long_side: int,
+    show_labels: bool,
+):
     from PIL import Image, ImageDraw
 
     source = source.convert("RGB")
@@ -581,6 +603,9 @@ def _render_overlay(source, heatmap, title: str, alpha: float, long_side: int):
         )
     overlay = heatmap.resize(source.size, Image.Resampling.BILINEAR)
     blended = Image.blend(source, overlay, alpha)
+    if not show_labels:
+        return blended
+
     header = 58 if "\n" in title else 38
     canvas = Image.new("RGB", (source.width, source.height + header), "white")
     canvas.paste(blended, (0, header))
