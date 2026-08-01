@@ -7,10 +7,10 @@ import torch
 from PIL import Image
 
 from attention_map_diffusers.capture.collector import AttentionCollector
-from attention_map_diffusers.capture.config import CaptureConfig, normalize_indices
+from attention_map_diffusers.capture.config import ALL_RELATIONS, CaptureConfig, normalize_indices
 from attention_map_diffusers.capture.compute import compute_attention_probs, reduce_heads
 from attention_map_diffusers.capture.records import AttentionRecord, ModalityRange, TokenGrid, make_layout
-from attention_map_diffusers.visualization import AttentionVisualizer, VisualizationConfig
+from attention_map_diffusers.visualization import AttentionVisualizer, VisualizationConfig, _record_title
 
 
 class FakeTokenizer:
@@ -50,12 +50,36 @@ def make_record(relation, data, *, q_grid=None, k_grid=None, metadata=None):
 
 
 class VisualizationTests(unittest.TestCase):
+    def test_text_matrix_aggregate_title_is_clean(self):
+        record = make_record("text->text", torch.rand(1, 1, 4, 4))
+        record.layer_id = "aggregate"
+        self.assertEqual(_record_title(record, "text->text", "aggregate (25 maps)"), "text->text")
+
     def test_full_patch_aggregate_is_the_safe_default(self):
         config = VisualizationConfig()
         self.assertIsNone(config.max_items)
         self.assertFalse(config.save_layer_maps)
         self.assertFalse(config.show_spatial_labels)
         self.assertEqual(CaptureConfig().max_map_elements, 128_000_000)
+        self.assertEqual(CaptureConfig().timesteps, "last")
+
+    def test_only_implemented_relations_and_modes_are_accepted(self):
+        self.assertEqual(
+            ALL_RELATIONS,
+            (
+                "image->text",
+                "text->image",
+                "image->image",
+                "text->text",
+                "video->text",
+                "text->video",
+                "video->video",
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported attention relation"):
+            CaptureConfig(relations=["audio->text"])
+        with self.assertRaisesRegex(ValueError, "mode must be one of"):
+            CaptureConfig(mode="stream")
 
     def test_last_timestep_mode_discards_earlier_records(self):
         query = torch.randn(1, 1, 4, 8)
@@ -75,6 +99,48 @@ class VisualizationTests(unittest.TestCase):
             )
         self.assertEqual(len(collector.records), 1)
         self.assertEqual(collector.records[0].timestep, 5.0)
+        self.assertEqual(collector.records[0].step_index, 1)
+
+    def test_fast_capture_can_recompute_on_a_transient_device(self):
+        query = torch.randn(1, 2, 4, 8)
+        grid = TokenGrid(height=2, width=2)
+        image = ModalityRange("image", 0, 4, grid)
+        collector = AttentionCollector(
+            CaptureConfig(
+                relations=["image->image"],
+                mode="fast",
+                offload="cpu",
+                heads="mean",
+            )
+        )
+        collector.capture_qk(
+            layer_id="test",
+            attention_type="self",
+            query=query,
+            key=query,
+            layout=make_layout([image], [image]),
+        )
+        maps = collector.compute(compute_device="cpu")
+        self.assertEqual(maps.records[0].data.device.type, "cpu")
+        self.assertEqual(maps.validate()["status"], "pass")
+
+    def test_explicit_timestep_sequence_captures_only_selected_steps(self):
+        query = torch.randn(1, 1, 4, 8)
+        grid = TokenGrid(height=2, width=2)
+        image = ModalityRange("image", 0, 4, grid)
+        collector = AttentionCollector(
+            CaptureConfig(relations=["image->image"], timesteps=[10, 5], mode="exact")
+        )
+        for timestep in (10, 7, 5):
+            collector.set_step(timestep=timestep)
+            collector.capture_qk(
+                layer_id=f"step-{timestep}",
+                attention_type="self",
+                query=query,
+                key=query,
+                layout=make_layout([image], [image]),
+            )
+        self.assertEqual([record.timestep for record in collector.records], [10.0, 5.0])
 
     def test_overlay_respects_spatial_long_side(self):
         grid = TokenGrid(height=2, width=2)
@@ -163,6 +229,101 @@ class VisualizationTests(unittest.TestCase):
             parsed = json.loads((root / "visualization.json").read_text())
             self.assertFalse(parsed["warnings"])
 
+    def test_token_concatenated_text_encoders_are_saved_by_component(self):
+        components = [
+            {
+                "name": "clip-fused",
+                "indices_by_batch": [[0, 1]],
+                "token_indices_by_batch": [[0, 1]],
+            },
+            {
+                "name": "t5",
+                "indices_by_batch": [[2, 3]],
+                "token_indices_by_batch": [[0, 1]],
+            },
+        ]
+        grid = TokenGrid(height=2, width=2)
+        records = [
+            make_record(
+                "image->text",
+                torch.rand(1, 1, 4, 4),
+                q_grid=grid,
+                metadata={"text_components": components},
+            ),
+            make_record(
+                "text->text",
+                torch.rand(1, 1, 4, 4),
+                metadata={"text_components": components},
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = AttentionVisualizer(VisualizationConfig(max_items=None)).save(
+                records,
+                root / "visuals",
+                tokenizer={"clip-fused": FakeTokenizer(), "t5": FakeTokenizer()},
+                prompts=["red cat"],
+            )
+            image_maps = root / "visuals/image-to-text/aggregate/batch-000/maps"
+            self.assertTrue(list((image_maps / "clip-fused").glob("token-*.png")))
+            self.assertTrue(list((image_maps / "t5").glob("token-*.png")))
+            matrix_maps = root / "visuals/text-to-text/aggregate/batch-000/maps"
+            self.assertTrue((matrix_maps / "clip-fused-to-t5/attention-matrix.png").is_file())
+            self.assertTrue((matrix_maps / "t5-to-clip-fused/attention-matrix.png").is_file())
+            self.assertFalse(manifest["warnings"])
+
+            collector = AttentionCollector(CaptureConfig(relations="all"))
+            for record in records:
+                collector.add_record(record)
+            collector.compute().save(
+                root / "saved",
+                save_raw=True,
+                save_visualizations=False,
+            )
+            self.assertEqual(len(list((root / "saved/raw").rglob("*.pt"))), 2)
+            self.assertEqual(len(list((root / "saved/raw-components").rglob("*.pt"))), 6)
+
+    def test_video_relations_render_frame_maps_gifs_and_overlays(self):
+        grid = TokenGrid(frames=2, height=2, width=3, patch_size=2, temporal_patch_size=1)
+        records = [
+            make_record("video->text", torch.rand(1, 1, 12, 4), q_grid=grid),
+            make_record("text->video", torch.rand(1, 1, 4, 12), k_grid=grid),
+            make_record(
+                "video->video",
+                torch.rand(1, 1, 1, 12),
+                q_grid=grid,
+                k_grid=grid,
+                metadata={"query_indices": (7,)},
+            ),
+        ]
+        source_video = [[Image.new("RGB", (96, 64), color) for color in ("red", "green", "blue", "white")]]
+        config = VisualizationConfig(
+            spatial_long_side=64,
+            max_items=1,
+            overview_items=1,
+            video_fps=4,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = AttentionVisualizer(config).save(
+                records,
+                directory,
+                tokenizer=FakeTokenizer(),
+                prompts=["red cat"],
+                videos=source_video,
+            )
+            root = Path(directory)
+            self.assertEqual(
+                set(manifest["relations"]),
+                {"video->text", "text->video", "video->video"},
+            )
+            self.assertFalse(manifest["warnings"])
+            for slug in ("video-to-text", "text-to-video", "video-to-video"):
+                aggregate = root / slug / "aggregate" / "batch-000"
+                self.assertTrue(list((aggregate / "maps").glob("*.gif")))
+                self.assertTrue(list((aggregate / "overlays").glob("*.gif")))
+                self.assertEqual(len(list((aggregate / "maps").rglob("frame-*.png"))), 2)
+                self.assertEqual(len(list((aggregate / "overlays").rglob("frame-*.png"))), 4)
+
     def test_text_matrix_contains_axis_margins(self):
         record = make_record("text->text", torch.rand(1, 1, 6, 6))
         config = VisualizationConfig(save_layer_maps=False, spatial_long_side=64)
@@ -190,6 +351,42 @@ class VisualizationTests(unittest.TestCase):
             aggregate = Path(directory) / "text-to-text/aggregate"
             self.assertTrue((aggregate / "batch-000/maps/attention-matrix.png").is_file())
             self.assertFalse((aggregate / "batch-001").exists())
+
+    def test_separate_cfg_calls_use_conditional_record_by_default(self):
+        conditional = make_record(
+            "text->text",
+            torch.eye(6).reshape(1, 1, 6, 6),
+            metadata={"guidance_role": "conditional"},
+        )
+        unconditional = make_record(
+            "text->text",
+            torch.ones(1, 1, 6, 6) / 6,
+            metadata={"guidance_role": "unconditional"},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = AttentionVisualizer(VisualizationConfig()).save(
+                [conditional, unconditional],
+                directory,
+                tokenizer=FakeTokenizer(),
+                prompts=["red cat"],
+            )
+            self.assertEqual(
+                manifest["relations"]["text->text"]["aggregate"]["source_records"],
+                1,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = AttentionVisualizer(VisualizationConfig()).save(
+                [conditional, unconditional],
+                directory,
+                tokenizer=FakeTokenizer(),
+                prompts=["red cat"],
+                unconditional=False,
+            )
+            self.assertEqual(
+                manifest["relations"]["text->text"]["aggregate"]["source_records"],
+                2,
+            )
 
     def test_image_to_image_writes_one_map_and_overlay_per_query_patch(self):
         grid = TokenGrid(height=3, width=4)
@@ -238,6 +435,25 @@ class VisualizationTests(unittest.TestCase):
             self.assertFalse((Path(directory) / "visuals").exists())
             self.assertEqual(result, {"relations": {}, "warnings": []})
 
+    def test_saved_metadata_contains_capture_provenance_and_prompts(self):
+        record = make_record("text->text", torch.rand(1, 1, 4, 4))
+        collector = AttentionCollector(
+            CaptureConfig(relations=["text->text"]),
+            metadata={"model_id": "example/video-model", "seed": 2026},
+        )
+        collector.add_record(record)
+        with tempfile.TemporaryDirectory() as directory:
+            collector.compute().save(
+                directory,
+                prompts=["a fox running through snow"],
+                save_visualizations=False,
+            )
+            metadata = json.loads((Path(directory) / "metadata.json").read_text())
+            self.assertEqual(metadata["provenance"]["model_id"], "example/video-model")
+            self.assertEqual(metadata["provenance"]["seed"], 2026)
+            self.assertEqual(metadata["provenance"]["prompts"], ["a fox running through snow"])
+            self.assertIn("peak_capture_bytes", metadata["provenance"])
+
     def test_multiresolution_spatial_records_share_one_aggregate(self):
         records = [
             make_record("image->text", torch.rand(1, 1, 4, 6), q_grid=TokenGrid(height=2, width=2)),
@@ -254,6 +470,82 @@ class VisualizationTests(unittest.TestCase):
 
 
 class CaptureComputeTests(unittest.TestCase):
+    def test_capture_budget_also_covers_maps_materialized_after_fast_capture(self):
+        query = torch.randn(1, 1, 4, 8)
+        image = ModalityRange("image", 0, 2, TokenGrid(height=1, width=2))
+        text = ModalityRange("text", 2, 4)
+        collector = AttentionCollector(
+            CaptureConfig(
+                relations="all",
+                mode="fast",
+                offload=None,
+                max_capture_bytes=260,
+            )
+        )
+        collector.capture_qk(
+            layer_id="post-compute-budget",
+            attention_type="joint",
+            query=query,
+            key=query.clone(),
+            layout=make_layout([image, text], [image, text]),
+        )
+        with self.assertRaisesRegex(RuntimeError, "cumulative capture budget"):
+            collector.compute()
+
+    def test_total_capture_budget_stops_cumulative_qk_storage(self):
+        query = torch.randn(1, 2, 4, 8)
+        image = ModalityRange("image", 0, 4, TokenGrid(height=2, width=2))
+        collector = AttentionCollector(
+            CaptureConfig(
+                relations=["image->image"],
+                mode="fast",
+                offload=None,
+                max_capture_bytes=500,
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "Capture storage would exceed"):
+            collector.capture_qk(
+                layer_id="over-budget",
+                attention_type="self",
+                query=query,
+                key=query.clone(),
+                layout=make_layout([image], [image]),
+            )
+        self.assertFalse(collector.records)
+
+    def test_fast_capture_shares_offloaded_qk_and_releases_them_after_compute(self):
+        query = torch.randn(1, 2, 4, 8)
+        key = torch.randn(1, 2, 4, 8)
+        image = ModalityRange("image", 0, 2, TokenGrid(height=1, width=2))
+        text = ModalityRange("text", 2, 4)
+        collector = AttentionCollector(
+            CaptureConfig(relations="all", mode="fast", offload="cpu", dtype="float64")
+        )
+        collector.capture_qk(
+            layer_id="shared-storage",
+            attention_type="joint",
+            query=query,
+            key=key,
+            layout=make_layout([image, text], [image, text]),
+        )
+
+        self.assertEqual(len(collector.records), 4)
+        self.assertEqual(
+            len({record.q.untyped_storage().data_ptr() for record in collector.records}),
+            1,
+        )
+        self.assertEqual(
+            len({record.k.untyped_storage().data_ptr() for record in collector.records}),
+            1,
+        )
+
+        maps = collector.compute()
+        self.assertTrue(all(record.data is not None for record in maps))
+        self.assertTrue(all(record.q is None and record.k is None for record in maps))
+        self.assertTrue(
+            all(record.q is None and record.k is None for record in collector.records)
+        )
+
     def test_head_mean_is_reduced_during_chunked_compute(self):
         query = torch.randn(2, 4, 7, 8)
         key = torch.randn(2, 4, 5, 8)

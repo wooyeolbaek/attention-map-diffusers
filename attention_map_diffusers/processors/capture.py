@@ -12,6 +12,8 @@ from attention_map_diffusers.capture.config import normalize_indices
 from attention_map_diffusers.capture.context import current_context
 from attention_map_diffusers.capture.records import AttentionRecord, ModalityRange, TokenGrid, infer_2d_grid, make_layout
 
+from .base import BaseCaptureProcessor
+
 
 def _require_diffusers_attention():
     try:
@@ -22,16 +24,6 @@ def _require_diffusers_attention():
             "Install diffusers before using AttentionCapture with a pipeline."
         ) from exc
     return Attention
-
-
-class BaseCaptureProcessor:
-    def __init__(self, collector, layer_id: str, original_processor=None):
-        self.collector = collector
-        self.layer_id = layer_id
-        self.original_processor = original_processor
-
-    def _capture(self, **kwargs) -> None:
-        self.collector.capture_qk(layer_id=self.layer_id, **kwargs)
 
 
 class CaptureAttnProcessor2_0(BaseCaptureProcessor):
@@ -99,8 +91,18 @@ class CaptureAttnProcessor2_0(BaseCaptureProcessor):
             attention_type=attention_type,
             input_height=input_height,
             input_width=input_width,
+            layer_id=self.layer_id,
         )
         context = current_context()
+        capture_metadata = dict(context.metadata)
+        if _is_text_self_attention(self.layer_id, attention_type):
+            capture_metadata["text_components"] = _local_text_components(
+                context,
+                component_name="mllm",
+                batch_size=int(query.shape[0]),
+                token_count=int(query.shape[-2]),
+            )
+            capture_metadata["text_attention_stage"] = "token-refiner"
         self._capture(
             attention_type=attention_type,
             query=query,
@@ -108,7 +110,7 @@ class CaptureAttnProcessor2_0(BaseCaptureProcessor):
             layout=layout,
             attention_mask=attention_mask,
             timestep=context.timestep,
-            metadata=context.metadata,
+            metadata=capture_metadata,
         )
 
         hidden_states = F.scaled_dot_product_attention(
@@ -810,7 +812,7 @@ class CaptureSanaLinearAttnProcessor2_0(BaseCaptureProcessor):
         if key_indices is not None:
             metadata["key_indices"] = tuple(key_indices)
 
-        self.collector.records.append(
+        self.collector.add_record(
             AttentionRecord(
                 layer_id=self.layer_id,
                 relation="image->image",
@@ -844,6 +846,10 @@ SUPPORTED_PROCESSOR_NAMES = {
     "SanaLinearAttnProcessor2_0": CaptureSanaLinearAttnProcessor2_0,
 }
 
+from .video import VIDEO_PROCESSOR_NAMES
+
+SUPPORTED_PROCESSOR_NAMES.update(VIDEO_PROCESSOR_NAMES)
+
 
 def make_capture_processor(original_processor, collector, layer_id: str):
     cls = SUPPORTED_PROCESSOR_NAMES.get(original_processor.__class__.__name__)
@@ -859,8 +865,12 @@ def _standard_layout(
     attention_type: str,
     input_height: Optional[int] = None,
     input_width: Optional[int] = None,
+    layer_id: Optional[str] = None,
 ):
     context = current_context()
+    if _is_text_self_attention(layer_id, attention_type):
+        text_range = ModalityRange("text", 0, query_tokens, None)
+        return make_layout([text_range], [text_range])
     if input_height is not None and input_width is not None:
         image_grid = TokenGrid(height=int(input_height), width=int(input_width))
     else:
@@ -874,6 +884,49 @@ def _standard_layout(
         [ModalityRange("image", 0, query_tokens, image_grid)],
         [ModalityRange("text", 0, key_tokens, None)],
     )
+
+
+def _is_text_self_attention(layer_id: Optional[str], attention_type: str) -> bool:
+    """Identify denoiser-internal attention that refines text tokens only."""
+    return (
+        attention_type == "self"
+        and layer_id is not None
+        and ".context_embedder.token_refiner." in layer_id
+    )
+
+
+def _local_text_components(
+    context,
+    *,
+    component_name: str,
+    batch_size: int,
+    token_count: int,
+):
+    """Translate combined-sequence metadata back to a local encoder sequence."""
+    for component in context.text_components or []:
+        if str(component.get("name")) != component_name:
+            continue
+        token_batches = component.get("token_indices_by_batch") or []
+        if not token_batches:
+            break
+        local_batches = [
+            [int(index) for index in batch if 0 <= int(index) < token_count]
+            for batch in token_batches
+        ]
+        item = dict(component)
+        item["indices_by_batch"] = local_batches
+        item["token_indices_by_batch"] = [list(batch) for batch in local_batches]
+        return [item]
+
+    indices = list(range(token_count))
+    return [
+        {
+            "name": component_name,
+            "fusion": "sequence",
+            "indices_by_batch": [list(indices) for _ in range(batch_size)],
+            "token_indices_by_batch": [list(indices) for _ in range(batch_size)],
+        }
+    ]
 
 
 def _joint_layout_image_text(image_tokens: int, text_tokens: int, image_grid: Optional[TokenGrid]):

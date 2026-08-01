@@ -13,17 +13,18 @@ authors:
     orcid: "https://orcid.org/0009-0005-5322-888X"
 abstract: >-
   A Python package for extracting and visualizing relation-aware text-to-text,
-  text-to-image, image-to-text, and image-to-image attention maps from Hugging
-  Face Diffusers image-generation pipelines.
+  text-to-image, image-to-text, image-to-image, text-to-video, video-to-text,
+  and video-to-video attention maps from Hugging Face Diffusers pipelines.
 keywords:
   - attention maps
   - diffusion models
   - diffusers
   - interpretability
   - text-to-image generation
+  - text-to-video generation
 repository-code: "https://github.com/wooyeolbaek/attention-map-diffusers"
 url: "https://doi.org/10.5281/zenodo.18304023"
 doi: "10.5281/zenodo.18304023"
 license: MIT
 version: 1.0.0
-date-released: 2026-07-31
+date-released: 2026-08-01

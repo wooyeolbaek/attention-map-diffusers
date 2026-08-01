@@ -23,7 +23,7 @@ IndexSelection = Union[str, int, Sequence[int], None]
 class CaptureConfig:
     relations: Tuple[str, ...] = DEFAULT_RELATIONS
     layers: Union[str, Sequence[str]] = "all"
-    timesteps: Union[str, Sequence[int]] = "all"
+    timesteps: Union[str, Sequence[int]] = "last"
     heads: Union[str, Sequence[int]] = "mean"
     mode: str = "fast"
     offload: Optional[str] = "cpu"
@@ -35,19 +35,31 @@ class CaptureConfig:
     tokens: IndexSelection = None
     chunk_size: int = 1024
     max_map_elements: int = 128_000_000
+    max_capture_bytes: Optional[int] = 8 * 1024**3
     allow_large_maps: bool = False
-    capture_unconditional: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "relations", normalize_relations(self.relations))
-        if isinstance(self.timesteps, str) and self.timesteps not in {"all", "last"}:
-            raise ValueError("timesteps must be 'all', 'last', or a sequence of timestep integers.")
-        if self.mode not in {"fast", "exact", "stream"}:
-            raise ValueError("mode must be one of: 'fast', 'exact', 'stream'.")
+        if isinstance(self.timesteps, str):
+            if self.timesteps not in {"all", "last"}:
+                raise ValueError(
+                    "timesteps must be 'all', 'last', or a sequence of timestep integers."
+                )
+        else:
+            try:
+                object.__setattr__(self, "timesteps", tuple(int(item) for item in self.timesteps))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "timesteps must be 'all', 'last', or a sequence of timestep integers."
+                ) from exc
+        if self.mode not in {"fast", "exact"}:
+            raise ValueError("mode must be one of: 'fast', 'exact'.")
         if self.chunk_size <= 0:
             raise ValueError("chunk_size must be positive.")
         if self.max_map_elements <= 0:
             raise ValueError("max_map_elements must be positive.")
+        if self.max_capture_bytes is not None and self.max_capture_bytes <= 0:
+            raise ValueError("max_capture_bytes must be positive or None.")
 
 
 def normalize_relations(relations: Union[str, Iterable[str], None]) -> Tuple[str, ...]:
@@ -64,6 +76,14 @@ def normalize_relations(relations: Union[str, Iterable[str], None]) -> Tuple[str
             normalized.extend(ALL_RELATIONS)
         elif relation and relation not in normalized:
             normalized.append(relation)
+    normalized = list(dict.fromkeys(normalized))
+    unsupported = [relation for relation in normalized if relation not in ALL_RELATIONS]
+    if unsupported:
+        supported = ", ".join(ALL_RELATIONS)
+        raise ValueError(
+            f"Unsupported attention relation(s): {', '.join(unsupported)}. "
+            f"Supported relations: {supported}."
+        )
     return tuple(normalized or DEFAULT_RELATIONS)
 
 

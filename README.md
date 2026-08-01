@@ -1,58 +1,64 @@
 # attention-map-diffusers
 
-Relation-aware attention visualization for Hugging Face Diffusers
-image-generation pipelines.
+Relation-aware attention capture and visualization for Hugging Face Diffusers
+image and video pipelines.
 
 [![PyPI](https://img.shields.io/pypi/v/attention-map-diffusers.svg)](https://pypi.org/project/attention-map-diffusers/)
-[![Python](https://img.shields.io/pypi/pyversions/attention-map-diffusers.svg)](https://pypi.org/project/attention-map-diffusers/)
+[![CI](https://github.com/wooyeolBaek/attention-map-diffusers/actions/workflows/ci.yml/badge.svg)](https://github.com/wooyeolBaek/attention-map-diffusers/actions/workflows/ci.yml)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18304023.svg)](https://doi.org/10.5281/zenodo.18304023)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## Visualization
 
-Generated with [`black-forest-labs/FLUX.2-klein-4B`](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B)
-at 1024×1024, 4 steps, seed `2026`.
+### Image · FLUX.2 Klein
 
-> Editorial wildlife photograph of a red fox wearing round glasses beside a
-> glowing blue lantern in a snowy pine forest at dusk.
+Prompt: *Editorial wildlife photograph of a red fox wearing round glasses
+beside a glowing blue lantern in a snowy pine forest at dusk.*
 
-![FLUX.2 Klein generated red fox](./assets/examples/flux2-klein-generated.png)
-
-| text→text | text→image · query token `lantern` |
+| text→text | text→image · `lantern` |
 | :---: | :---: |
-| ![FLUX.2 Klein text-to-text attention matrix](./assets/examples/flux2-klein-text-text.png) | ![FLUX.2 Klein text-to-image attention for lantern](./assets/examples/flux2-klein-text-image-lantern.png) |
-| **image→text · key token `lantern`** | **image→image · center query patch** |
-| ![FLUX.2 Klein image-to-text attention for lantern](./assets/examples/flux2-klein-image-text-lantern.png) | ![FLUX.2 Klein image-to-image attention for the center patch](./assets/examples/flux2-klein-image-image-center.png) |
+| <img src="./assets/examples/flux2-klein-text-text.png" alt="Token-to-token matrix" width="360"> | <img src="./assets/examples/flux2-klein-text-image-lantern.png" alt="Text-to-image attention" width="360"> |
+| **image→text · `lantern`** | **image→image · center patch** |
+| <img src="./assets/examples/flux2-klein-image-text-lantern.png" alt="Image-to-text attention" width="360"> | <img src="./assets/examples/flux2-klein-image-image-center.png" alt="Image-to-image attention" width="360"> |
 
-Attention is averaged across heads and 25 layers at denoising timestep
-`0.96875` (step 2 of 4). Spatial maps are image-only overlays by default;
-map-only PNGs are saved alongside them.
+### Video · Wan 2.1 T2V 1.3B
 
-| Relation | Visualization |
-| --- | --- |
-| `text→text` | Token matrix with query tokens on y and key tokens on x |
-| `text→image` | Image-shaped heatmap for each query token |
-| `image→text` | Image-shaped heatmap for each key token |
-| `image→image` | Key-patch heatmap for every selected query patch |
+Prompt: *A cinematic tracking shot of a red fox running across pristine snow
+in a pine forest, detailed fur, natural winter light, smooth motion, stable camera.*
+
+| video→text · `fox` | video→video · center patch |
+| :---: | :---: |
+| <img src="./assets/examples/wan-video-text-fox.gif" alt="Wan video-to-text attention" width="360"> | <img src="./assets/examples/wan-video-video-center.gif" alt="Wan video-to-video attention" width="360"> |
+
+Wan exposes cross-attention (`video→text`) and spatial-temporal self-attention
+(`video→video`), so the table shows every relation in its denoiser.
+
+Spatial examples are attention overlays, so the generated source is not shown
+again. Video maps preserve the patch grid as `(T,H,W)`; each GIF also has
+per-frame PNG output. Spatial labels are off by default.
 
 ## Compatible models
 
 Requires `diffusers>=0.39.0`.
 
-| Demo key | Diffusers checkpoint | Relations |
+| Key | Checkpoint | Relations |
 | --- | --- | --- |
-| `flux2-klein` | [`black-forest-labs/FLUX.2-klein-4B`](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | All four |
-| `z-image-turbo` | [`Tongyi-MAI/Z-Image-Turbo`](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | All four |
-| `prx-pixel` | [`Photoroom/prxpixel-t2i`](https://huggingface.co/Photoroom/prxpixel-t2i) | `image→text`, `image→image` |
-| `flux-schnell` | [`black-forest-labs/FLUX.1-schnell`](https://huggingface.co/black-forest-labs/FLUX.1-schnell) | All four |
-| `flux-dev` | [`black-forest-labs/FLUX.1-dev`](https://huggingface.co/black-forest-labs/FLUX.1-dev) | All four |
-| `sd3-5` | [`stabilityai/stable-diffusion-3.5-medium`](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium) | All four |
-| `sd3` | [`stabilityai/stable-diffusion-3-medium-diffusers`](https://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers) | All four |
-| `sana` | [`Efficient-Large-Model/Sana_1600M_1024px_diffusers`](https://huggingface.co/Efficient-Large-Model/Sana_1600M_1024px_diffusers) | `image→text`, `image→image` |
-| `sdxl` | [`stabilityai/stable-diffusion-xl-base-1.0`](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) | `image→text`, `image→image` |
-| `sd` | [`sd2-community/stable-diffusion-2-1`](https://huggingface.co/sd2-community/stable-diffusion-2-1) | `image→text`, `image→image` |
+| `flux2-klein` | [`black-forest-labs/FLUX.2-klein-4B`](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | image/text all |
+| `z-image-turbo` | [`Tongyi-MAI/Z-Image-Turbo`](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | image/text all |
+| `prx-pixel` | [`Photoroom/prxpixel-t2i`](https://huggingface.co/Photoroom/prxpixel-t2i) | image→text, image→image |
+| `flux-schnell` | [`black-forest-labs/FLUX.1-schnell`](https://huggingface.co/black-forest-labs/FLUX.1-schnell) | image/text all |
+| `flux-dev` | [`black-forest-labs/FLUX.1-dev`](https://huggingface.co/black-forest-labs/FLUX.1-dev) | image/text all |
+| `sd3-5` | [`stabilityai/stable-diffusion-3.5-medium`](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium) | image/text all |
+| `sd3` | [`stabilityai/stable-diffusion-3-medium-diffusers`](https://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers) | image/text all |
+| `sana` | [`Efficient-Large-Model/Sana_1600M_1024px_diffusers`](https://huggingface.co/Efficient-Large-Model/Sana_1600M_1024px_diffusers) | image→text, image→image |
+| `sdxl` | [`stabilityai/stable-diffusion-xl-base-1.0`](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) | image→text, image→image |
+| `sd` | [`sd2-community/stable-diffusion-2-1`](https://huggingface.co/sd2-community/stable-diffusion-2-1) | image→text, image→image |
+| `cogvideox-2b` | [`THUDM/CogVideoX-2b`](https://huggingface.co/THUDM/CogVideoX-2b) | video/text all |
+| `wan2.1-t2v-1.3b` | [`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) | video→text, video→video |
+| `hunyuan-video-1.5` | [`hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v`](https://huggingface.co/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v) | video/text all |
 
-“All four” means `text→text`, `text→image`, `image→text`, and `image→image`.
+“image/text all” is text→text, text→image, image→text, and image→image.
+“video/text all” is text→text, text→video, video→text, and video→video.
 
 ## Install
 
@@ -60,103 +66,118 @@ Requires `diffusers>=0.39.0`.
 pip install --upgrade attention-map-diffusers
 ```
 
-For demos and validators:
-
-```bash
-git clone https://github.com/wooyeolBaek/attention-map-diffusers.git
-cd attention-map-diffusers
-pip install -e .
-```
-
-## Quick start
+## Image quick start
 
 ```python
 import torch
 from diffusers import Flux2KleinPipeline
-from attention_map_diffusers import AttentionCapture, VisualizationConfig
+from attention_map_diffusers import AttentionCapture, text_tokenizers
 
-prompt = (
-    "Editorial wildlife photograph of a red fox wearing round glasses beside "
-    "a glowing blue lantern in a snowy pine forest at dusk."
-)
+prompt = "A red fox beside a glowing blue lantern in a snowy forest."
 pipe = Flux2KleinPipeline.from_pretrained(
-    "black-forest-labs/FLUX.2-klein-4B",
-    torch_dtype=torch.bfloat16,
+    "black-forest-labs/FLUX.2-klein-4B", torch_dtype=torch.bfloat16
 ).to("cuda")
 
 with AttentionCapture(
     pipe,
     relations=["text->text", "text->image", "image->text", "image->image"],
-    mode="fast",
-    heads="mean",
     offload="cuda",
 ) as capture:
-    images = pipe(
-        prompt=[prompt],
-        num_inference_steps=4,
-        guidance_scale=1.0,
-    ).images
+    images = pipe(prompt=[prompt], num_inference_steps=4).images
 
-maps = capture.compute()
-maps.save(
-    "outputs/attention",
-    tokenizer=pipe.tokenizer,
-    prompts=[prompt],
-    images=images,
-    visualization_config=VisualizationConfig(),
+capture.compute().save(
+    "outputs/attention", tokenizer=text_tokenizers(pipe),
+    prompts=[prompt], images=images,
 )
 ```
 
-Or use the shared model runner:
+## Video quick start
 
-```bash
-python demo/run_attention_demo.py \
-  --model flux2-klein \
-  --relations all \
-  --mode fast \
-  --offload cuda
+```python
+import torch
+from diffusers import WanPipeline
+from attention_map_diffusers import AttentionCapture, VisualizationConfig, text_tokenizers
+
+prompt = "A cinematic tracking shot of a red fox running across snow in a pine forest."
+steps = 50
+pipe = WanPipeline.from_pretrained(
+    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", torch_dtype=torch.bfloat16
+).to("cuda")
+pipe.scheduler.set_timesteps(steps, device="cuda")
+last_timestep = [float(pipe.scheduler.timesteps[-1])]
+
+with AttentionCapture(
+    pipe,
+    relations=["video->text", "video->video"],
+    timesteps=last_timestep,
+    relation_query_indices={"video->video": "center"},
+    offload="cpu",
+    max_capture_bytes=16 * 1024**3,
+) as capture:
+    videos = pipe(
+        prompt=[prompt], num_inference_steps=steps,
+        height=480, width=832, num_frames=81,
+    ).frames
+
+for component in pipe.components.values():
+    if isinstance(component, torch.nn.Module):
+        component.to("cpu")
+torch.cuda.empty_cache()
+capture.compute(compute_device="cuda").save(
+    "outputs/attention", tokenizer=text_tokenizers(pipe),
+    prompts=[prompt], videos=videos,
+    visualization_config=VisualizationConfig(max_items=16, video_fps=16),
+)
 ```
 
-## Output
+The shared runner contains native model defaults and reproducible metadata:
+
+```bash
+python demo/run_attention_demo.py --model flux2-klein --relations all
+python demo/run_attention_demo.py --model wan2.1-t2v-1.3b --relations all
+```
+
+## Output and controls
 
 ```text
-outputs/
-  metadata.json
-  raw/<relation>/*.pt                    # optional
-  visuals/<relation>/
-    aggregate/batch-000/
-      maps/*.png
-      overlays/*.png
-    steps/<timestep>/<layer>/            # optional
+attention/
+  metadata.json                         # provenance + capture settings
+  raw/<relation>/*.pt                   # only with --save-raw
+  raw-components/<relation>/<encoder>/ # token-concatenated encoders
+  visuals/<relation>/aggregate/batch-000/
+    maps/*.png                          # image attention
+    maps/*.gif                          # video attention
+    maps/<encoder>/*                    # token-concatenated encoders
+    maps/<item>/frames/*.png
+    overlays/                           # generated-media overlays, separate
 ```
 
-- All image query/key patches are retained by default. Use
-  `--large-relation-query-indices sample:9` to limit image→image outputs.
-- Aggregate attention is saved by default. Add `--capture-timesteps all` and
-  `--save-layer-maps` for every timestep and layer.
-- Use `--heads mean`, `--heads all`, or a selection such as `--heads 0,2`.
-- Raw `.pt` tensors are not required for visualization and are only written
-  with `--save-raw`.
-- Maps and generated-image overlays are stored in separate directories.
-- Spatial PNGs contain only the image by default. Use `--show-spatial-labels`
-  or `VisualizationConfig(show_spatial_labels=True)` to add token/patch titles.
-
-See every runner option with:
-
-```bash
-python demo/run_attention_demo.py --help
-```
+- The final timestep and head mean are retained by default.
+- Use `--capture-timesteps all` and `--save-layer-maps` for every timestep and
+  layer. The default 8 GiB cumulative capture guard prevents silent RAM/VRAM
+  exhaustion.
+- Every image→image query patch is rendered by default. Video→video defaults to
+  the center query patch because a full `(query T×H×W)²` tensor is impractical;
+  use `--large-relation-query-indices sample:9` or `all` explicitly.
+- Raw `.pt` tensors are optional and are never required for visualization.
+- CFG stored as separate denoiser calls (HunyuanVideo 1.5) is tagged per call;
+  visualizations use the conditional call by default while raw capture keeps both.
+- Token-axis concatenation is preserved. SD3 saves fused-CLIP and T5 maps
+  separately (including all four text→text component pairs); HunyuanVideo 1.5
+  separates ByT5 and MLLM after its mask-based token reordering and records its
+  two MLLM token-refiner layers as MLLM→MLLM maps. Feature-axis fusion such as
+  SDXL CLIP-L+G remains one mathematically inseparable map.
+- Capture fails with a layer/processor report if any denoiser attention module
+  is unsupported, preventing silently incomplete results.
+- Use `--show-spatial-labels` only when token/patch titles are wanted.
 
 ## Validation
 
-All ten model integrations were tested on real weights across capture modes,
-relations, timesteps, layers, heads, patch selections, raw output, PNG
-integrity, and generation parity.
-
 ```bash
-pytest -q
-python demo/validate_generation_parity.py --model all
-python demo/validate_option_matrix.py option-matrix-outputs
+python -m pytest -q
+python demo/run_attention_demo.py --model all --relations all --dry-run
+python demo/audit_attention_coverage.py --model all
+python demo/validate_generation_parity.py --model cogvideox-2b --num-frames 9
 ```
 
 ## Citation
@@ -173,8 +194,4 @@ python demo/validate_option_matrix.py option-matrix-outputs
 }
 ```
 
-See [`CITATION.cff`](CITATION.cff) for machine-readable citation metadata.
-
-## License
-
-[MIT](LICENSE)
+[MIT License](LICENSE) · [CITATION.cff](CITATION.cff)

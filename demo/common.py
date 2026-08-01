@@ -4,7 +4,20 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional
 
 
-ALL_ATTENTION_RELATIONS = ("image->text", "text->image", "image->image", "text->text")
+IMAGE_ATTENTION_RELATIONS = (
+    "image->text",
+    "text->image",
+    "image->image",
+    "text->text",
+)
+
+VIDEO_ATTENTION_RELATIONS = (
+    "video->text",
+    "text->video",
+    "video->video",
+)
+
+ALL_ATTENTION_RELATIONS = IMAGE_ATTENTION_RELATIONS + VIDEO_ATTENTION_RELATIONS
 
 
 @dataclass(frozen=True)
@@ -21,8 +34,12 @@ class DemoModelConfig:
     guidance_scale: Optional[float] = None
     extra_from_pretrained_kwargs: Dict[str, object] = field(default_factory=dict)
     extra_call_kwargs: Dict[str, object] = field(default_factory=dict)
-    relations: tuple[str, ...] = ALL_ATTENTION_RELATIONS
-    tokenizer_attribute: str = "tokenizer"
+    relations: tuple[str, ...] = IMAGE_ATTENTION_RELATIONS
+    modality: str = "image"
+    default_num_frames: Optional[int] = None
+    fps: int = 8
+    default_large_relation_query_indices: str = "all"
+    default_max_visual_items: Optional[int] = None
 
 
 MODEL_CONFIGS: Dict[str, DemoModelConfig] = {
@@ -64,7 +81,6 @@ MODEL_CONFIGS: Dict[str, DemoModelConfig] = {
         default_height=1024,
         default_width=1024,
         guidance_scale=4.5,
-        tokenizer_attribute="tokenizer_3",
     ),
     "sd3-5": DemoModelConfig(
         key="sd3-5",
@@ -77,7 +93,6 @@ MODEL_CONFIGS: Dict[str, DemoModelConfig] = {
         default_height=1024,
         default_width=1024,
         guidance_scale=4.5,
-        tokenizer_attribute="tokenizer_3",
     ),
     "flux-schnell": DemoModelConfig(
         key="flux-schnell",
@@ -90,7 +105,6 @@ MODEL_CONFIGS: Dict[str, DemoModelConfig] = {
         default_height=1024,
         default_width=1024,
         guidance_scale=0.0,
-        tokenizer_attribute="tokenizer_2",
     ),
     "flux-dev": DemoModelConfig(
         key="flux-dev",
@@ -103,7 +117,6 @@ MODEL_CONFIGS: Dict[str, DemoModelConfig] = {
         default_height=1024,
         default_width=1024,
         guidance_scale=4.5,
-        tokenizer_attribute="tokenizer_2",
     ),
     "flux2-klein": DemoModelConfig(
         key="flux2-klein",
@@ -116,7 +129,6 @@ MODEL_CONFIGS: Dict[str, DemoModelConfig] = {
         default_height=1024,
         default_width=1024,
         guidance_scale=1.0,
-        tokenizer_attribute="tokenizer",
     ),
     "z-image-turbo": DemoModelConfig(
         key="z-image-turbo",
@@ -130,7 +142,6 @@ MODEL_CONFIGS: Dict[str, DemoModelConfig] = {
         default_width=1024,
         guidance_scale=0.0,
         extra_from_pretrained_kwargs={"low_cpu_mem_usage": False},
-        tokenizer_attribute="tokenizer",
     ),
     "prx-pixel": DemoModelConfig(
         key="prx-pixel",
@@ -145,7 +156,6 @@ MODEL_CONFIGS: Dict[str, DemoModelConfig] = {
         guidance_scale=5.0,
         extra_call_kwargs={"use_resolution_binning": False},
         relations=("image->text", "image->image"),
-        tokenizer_attribute="tokenizer",
     ),
     "sana": DemoModelConfig(
         key="sana",
@@ -160,6 +170,60 @@ MODEL_CONFIGS: Dict[str, DemoModelConfig] = {
         guidance_scale=5.0,
         extra_from_pretrained_kwargs={"variant": "fp16"},
         relations=("image->text", "image->image"),
+    ),
+    "cogvideox-2b": DemoModelConfig(
+        key="cogvideox-2b",
+        pipeline_class="CogVideoXPipeline",
+        model_id="THUDM/CogVideoX-2b",
+        torch_dtype="float16",
+        prompt="A red fox runs through fresh snow while the camera follows smoothly.",
+        output_name="cogvideox-2b",
+        default_steps=50,
+        default_height=480,
+        default_width=720,
+        default_num_frames=49,
+        guidance_scale=6.0,
+        relations=("video->text", "text->video", "video->video", "text->text"),
+        modality="video",
+        fps=8,
+        default_large_relation_query_indices="center",
+        default_max_visual_items=16,
+    ),
+    "wan2.1-t2v-1.3b": DemoModelConfig(
+        key="wan2.1-t2v-1.3b",
+        pipeline_class="WanPipeline",
+        model_id="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        torch_dtype="bfloat16",
+        prompt="A red fox runs through fresh snow while the camera follows smoothly.",
+        output_name="wan2-1-t2v-1-3b",
+        default_steps=50,
+        default_height=480,
+        default_width=832,
+        default_num_frames=81,
+        guidance_scale=5.0,
+        relations=("video->text", "video->video"),
+        modality="video",
+        fps=16,
+        default_large_relation_query_indices="center",
+        default_max_visual_items=16,
+    ),
+    "hunyuan-video-1.5": DemoModelConfig(
+        key="hunyuan-video-1.5",
+        pipeline_class="HunyuanVideo15Pipeline",
+        model_id="hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v",
+        torch_dtype="bfloat16",
+        prompt="A red fox runs through fresh snow while the camera follows smoothly.",
+        output_name="hunyuan-video-1-5",
+        default_steps=50,
+        default_height=480,
+        default_width=832,
+        default_num_frames=121,
+        guidance_scale=None,
+        relations=("video->text", "text->video", "video->video", "text->text"),
+        modality="video",
+        fps=15,
+        default_large_relation_query_indices="center",
+        default_max_visual_items=16,
     ),
 }
 

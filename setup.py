@@ -5,9 +5,22 @@ from setuptools import find_packages, setup
 
 ROOT = Path(__file__).parent
 README = (ROOT / "README.md").read_text(encoding="utf-8")
+ASSET_BASE_URL = (
+    "https://raw.githubusercontent.com/wooyeolbaek/"
+    "attention-map-diffusers/main/assets/"
+)
 PYPI_README = README.replace(
     "](./assets/",
-    "](https://raw.githubusercontent.com/wooyeolbaek/attention-map-diffusers/main/assets/",
+    f"]({ASSET_BASE_URL}",
+).replace(
+    'src="./assets/',
+    f'src="{ASSET_BASE_URL}',
+).replace(
+    "](LICENSE)",
+    "](https://github.com/wooyeolbaek/attention-map-diffusers/blob/main/LICENSE)",
+).replace(
+    "](CITATION.cff)",
+    "](https://github.com/wooyeolbaek/attention-map-diffusers/blob/main/CITATION.cff)",
 )
 
 setup(
@@ -17,7 +30,7 @@ setup(
     author_email="wooyeol.baek@yonsei.ac.kr, mbaek01@korea.ac.kr",
     description=(
         "Extract and visualize relation-aware attention maps from "
-        "Hugging Face Diffusers pipelines"
+        "Hugging Face Diffusers image and video pipelines"
     ),
     long_description=PYPI_README,
     long_description_content_type="text/markdown",
@@ -38,6 +51,8 @@ setup(
         "diffusion models",
         "interpretability",
         "text-to-image",
+        "text-to-video",
+        "video diffusion",
     ],
     classifiers=[
         "Development Status :: 5 - Production/Stable",

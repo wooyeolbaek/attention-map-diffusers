@@ -16,6 +16,9 @@ from .utils import (
     save_attention_maps,
 )
 from .visualization import AttentionVisualizer, VisualizationConfig
+from .tokenizers import text_tokenizers
+
+__version__ = "1.0.0"
 
 __all__ = [
     "ALL_RELATIONS",
@@ -33,4 +36,6 @@ __all__ = [
     "init_pipeline",
     "restore_pipeline",
     "save_attention_maps",
+    "text_tokenizers",
+    "__version__",
 ]

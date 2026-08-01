@@ -4,7 +4,7 @@ import argparse
 import gc
 import json
 import os
-from typing import List
+from typing import List, Optional
 
 from PIL import Image
 
@@ -18,11 +18,11 @@ from common import (
 )
 
 
-def main(argv: List[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Run attention-map capture demos for supported Diffusers models.")
     parser.add_argument("--model", default="sd", help="Model key, comma-list, or 'all'.")
-    parser.add_argument("--relations", default="all", help="Relation list, e.g. image->text,text->image, or 'all'.")
-    parser.add_argument("--mode", default="fast", choices=["fast", "exact", "stream"])
+    parser.add_argument("--relations", default="all", help="Relation list, e.g. video->text,text->video, or 'all'.")
+    parser.add_argument("--mode", default="fast", choices=["fast", "exact"])
     parser.add_argument(
         "--capture-timesteps",
         default="last",
@@ -37,6 +37,8 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument("--height", type=int, default=None, help="Override the model's native height.")
     parser.add_argument("--width", type=int, default=None, help="Override the model's native width.")
+    parser.add_argument("--num-frames", type=int, default=None, help="Override a video model's frame count.")
+    parser.add_argument("--fps", type=int, default=None, help="GIF playback rate for video outputs.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--offload",
@@ -49,13 +51,16 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--query-indices", default="all", help="Global query selection; keep 'all' for token PNGs.")
     parser.add_argument(
         "--large-relation-query-indices",
-        default="all",
-        help="Query patches for image->image: 'center', 'sample:N', 'all', or comma-separated indices.",
+        default=None,
+        help=(
+            "Query patches for image->image or video->video: 'center', 'sample:N', 'all', or indices. "
+            "The model default is all image patches and the center video patch."
+        ),
     )
     parser.add_argument(
         "--large-relation-key-indices",
         default="all",
-        help="Key patches for image->image. Keep 'all' to render each query patch as a spatial map.",
+        help="Key patches for image->image or video->video. Keep 'all' for complete spatial maps.",
     )
     parser.add_argument("--key-indices", default="all", help="Use a comma list to limit key tokens.")
     parser.add_argument(
@@ -65,8 +70,8 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument(
         "--max-visual-items",
-        default="all",
-        help="Maximum token/patch PNGs per map, or 'all' (default).",
+        default=None,
+        help="Maximum token/patch outputs per map, or 'all'. Video models default to 16.",
     )
     parser.add_argument(
         "--spatial-long-side",
@@ -91,6 +96,12 @@ def main(argv: List[str] | None = None) -> int:
         help="Run generation and in-memory tensor validation without writing attention PNGs.",
     )
     parser.add_argument("--max-map-elements", type=int, default=128_000_000)
+    parser.add_argument(
+        "--max-capture-gib",
+        type=float,
+        default=8.0,
+        help="Maximum cumulative Q/K/map storage in GiB; use 0 to disable the guard.",
+    )
     parser.add_argument("--allow-large-maps", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Print the execution matrix without importing ML deps.")
     args = parser.parse_args(argv)
@@ -100,27 +111,35 @@ def main(argv: List[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
-    for name in ("steps", "height", "width", "spatial_long_side", "max_map_elements"):
+    for name in ("steps", "height", "width", "num_frames", "fps", "spatial_long_side", "max_map_elements"):
         value = getattr(args, name)
         if value is not None and value <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive.")
+    if args.max_capture_gib < 0:
+        parser.error("--max-capture-gib must be non-negative.")
 
     try:
         query_indices = parse_indices(args.query_indices)
         key_indices = parse_indices(args.key_indices)
-        large_relation_query_indices = parse_indices(args.large_relation_query_indices)
+        large_query_override = (
+            parse_indices(args.large_relation_query_indices)
+            if args.large_relation_query_indices is not None
+            else None
+        )
         large_relation_key_indices = parse_indices(args.large_relation_key_indices)
     except ValueError as exc:
         parser.error(str(exc))
 
-    if str(args.max_visual_items).lower() == "all":
-        max_visual_items = None
+    if args.max_visual_items is None:
+        max_visual_items_override = None
+    elif str(args.max_visual_items).lower() == "all":
+        max_visual_items_override = "all"
     else:
         try:
-            max_visual_items = int(args.max_visual_items)
+            max_visual_items_override = int(args.max_visual_items)
         except ValueError:
             parser.error("--max-visual-items must be a positive integer or 'all'.")
-        if max_visual_items <= 0:
+        if max_visual_items_override <= 0:
             parser.error("--max-visual-items must be a positive integer or 'all'.")
 
     try:
@@ -151,19 +170,35 @@ def main(argv: List[str] | None = None) -> int:
 
     import torch
     import diffusers
-    from attention_map_diffusers import AttentionCapture, VisualizationConfig
+    from attention_map_diffusers import AttentionCapture, VisualizationConfig, text_tokenizers
 
     os.makedirs(args.output_dir, exist_ok=True)
     failures = []
     for key in selected_models:
         config = MODEL_CONFIGS[key]
         relations = relation_list(config, args.relations)
+        large_query_spec = (
+            args.large_relation_query_indices
+            if args.large_relation_query_indices is not None
+            else config.default_large_relation_query_indices
+        )
+        large_relation_query_indices = (
+            large_query_override
+            if args.large_relation_query_indices is not None
+            else parse_indices(large_query_spec)
+        )
+        max_visual_items = (
+            config.default_max_visual_items
+            if max_visual_items_override is None
+            else None if max_visual_items_override == "all" else max_visual_items_override
+        )
         pipe = None
         result = None
         maps = None
         capture = None
         tokenizer = None
         generated_images = None
+        generated_videos = None
         try:
             pipeline_cls = getattr(diffusers, config.pipeline_class)
             dtype = getattr(torch, config.torch_dtype)
@@ -183,7 +218,7 @@ def main(argv: List[str] | None = None) -> int:
             if actual_steps < config.default_steps:
                 print(
                     f"[{key}] warning: {actual_steps} steps is below the recommended "
-                    f"{config.default_steps}; generated images may look incomplete or broken"
+                    f"{config.default_steps}; generated output may look incomplete or broken"
                 )
             if config.guidance_scale is not None:
                 call_kwargs["guidance_scale"] = config.guidance_scale
@@ -206,6 +241,9 @@ def main(argv: List[str] | None = None) -> int:
                 call_kwargs["height"] = height
             if width is not None:
                 call_kwargs["width"] = width
+            num_frames = args.num_frames if args.num_frames is not None else config.default_num_frames
+            if num_frames is not None:
+                call_kwargs["num_frames"] = num_frames
             if args.skip_visualization:
                 call_kwargs["output_type"] = "latent"
 
@@ -213,17 +251,27 @@ def main(argv: List[str] | None = None) -> int:
             relation_query_indices = {
                 relation: large_relation_query_indices
                 for relation in relations
-                if relation == "image->image" and large_relation_query_indices is not None
+                if relation in {"image->image", "video->video"} and large_relation_query_indices is not None
             }
             relation_key_indices = {
                 relation: large_relation_key_indices
                 for relation in relations
-                if relation == "image->image" and large_relation_key_indices is not None
+                if relation in {"image->image", "video->video"} and large_relation_key_indices is not None
             }
+            capture_timesteps = args.capture_timesteps
+            if (
+                args.capture_timesteps == "last"
+                and config.pipeline_class in {"CogVideoXPipeline", "WanPipeline"}
+            ):
+                # These pipelines call scheduler.set_timesteps(steps, device)
+                # unchanged. Filtering by that exact final value avoids copying
+                # native-resolution video Q/K to CPU on every earlier step.
+                pipe.scheduler.set_timesteps(actual_steps, device=args.device)
+                capture_timesteps = [float(pipe.scheduler.timesteps[-1])]
             with AttentionCapture(
                 pipe,
                 relations=relations,
-                timesteps=args.capture_timesteps,
+                timesteps=capture_timesteps,
                 mode=args.mode,
                 heads=selected_heads,
                 offload=args.device if args.offload == "same" else args.offload,
@@ -232,10 +280,32 @@ def main(argv: List[str] | None = None) -> int:
                 relation_query_indices=relation_query_indices,
                 relation_key_indices=relation_key_indices,
                 max_map_elements=args.max_map_elements,
+                max_capture_bytes=(
+                    None if args.max_capture_gib == 0 else int(args.max_capture_gib * 1024**3)
+                ),
                 allow_large_maps=args.allow_large_maps,
+                metadata={
+                    "model_key": key,
+                    "model_id": config.model_id,
+                    "seed": args.seed,
+                    "steps": actual_steps,
+                    "height": height,
+                    "width": width,
+                    "num_frames": num_frames,
+                },
             ) as capture:
                 result = pipe(prompt=[prompt], **call_kwargs)
-                maps = capture.compute()
+                compute_device = None
+                if args.offload == "cpu" and str(args.device).startswith("cuda"):
+                    # Native video Q/K can coexist with generation safely on
+                    # CPU. Release model VRAM after decoding, then recompute
+                    # each relation on CUDA without retaining duplicate Q/K.
+                    for component in pipe.components.values():
+                        if isinstance(component, torch.nn.Module):
+                            component.to("cpu")
+                    torch.cuda.empty_cache()
+                    compute_device = args.device
+                maps = capture.compute(compute_device=compute_device)
 
             model_dir = os.path.join(args.output_dir, key)
             os.makedirs(model_dir, exist_ok=True)
@@ -249,7 +319,12 @@ def main(argv: List[str] | None = None) -> int:
                 )
             generated_images = (
                 list(result.images)
-                if not args.skip_visualization and hasattr(result, "images")
+                if config.modality == "image" and not args.skip_visualization and hasattr(result, "images")
+                else []
+            )
+            generated_videos = (
+                _video_batches(result.frames)
+                if config.modality == "video" and not args.skip_visualization and hasattr(result, "frames")
                 else []
             )
             generated_dir = os.path.join(model_dir, "generated")
@@ -260,6 +335,16 @@ def main(argv: List[str] | None = None) -> int:
                     image.save(image_path)
                     with Image.open(image_path) as saved_image:
                         saved_image.verify()
+            for index, video in enumerate(generated_videos):
+                video_dir = os.path.join(generated_dir, f"{index:03d}-{config.output_name}")
+                os.makedirs(video_dir, exist_ok=True)
+                for frame_index, frame in enumerate(video):
+                    frame.save(os.path.join(video_dir, f"frame-{frame_index:04d}.png"))
+                _save_video_gif(
+                    video,
+                    os.path.join(generated_dir, f"{index:03d}-{config.output_name}.gif"),
+                    args.fps or config.fps,
+                )
 
             with open(os.path.join(model_dir, "run-config.json"), "w", encoding="utf-8") as handle:
                 json.dump(
@@ -274,13 +359,34 @@ def main(argv: List[str] | None = None) -> int:
                         "recommended_steps": config.default_steps,
                         "height": height,
                         "width": width,
+                        "num_frames": num_frames,
+                        "fps": args.fps or config.fps,
                         "generated_sizes": [list(image.size) for image in generated_images],
+                        "generated_video_sizes": [
+                            [len(video), *video[0].size] for video in generated_videos if video
+                        ],
+                        "attention_summary": maps.summary(),
+                        "guidance_roles": {
+                            str(role): sum(
+                                record.metadata.get("guidance_role") == role
+                                for record in maps.records
+                            )
+                            for role in sorted(
+                                {
+                                    record.metadata.get("guidance_role")
+                                    for record in maps.records
+                                    if record.metadata.get("guidance_role") is not None
+                                }
+                            )
+                        },
+                        "attention_coverage": capture.coverage,
+                        "text_conditioning": capture.text_conditioning,
                         "relations": relations,
                         "mode": args.mode,
                         "capture_timesteps": args.capture_timesteps,
                         "offload": args.device if args.offload == "same" else args.offload,
                         "query_indices": args.query_indices,
-                        "large_relation_query_indices": args.large_relation_query_indices,
+                        "large_relation_query_indices": large_query_spec,
                         "large_relation_key_indices": args.large_relation_key_indices,
                         "key_indices": args.key_indices,
                         "heads": selected_heads,
@@ -291,6 +397,7 @@ def main(argv: List[str] | None = None) -> int:
                         "raw_tensors": args.save_raw,
                         "visualizations": not args.skip_visualization,
                         "max_map_elements": args.max_map_elements,
+                        "max_capture_gib": args.max_capture_gib,
                         "allow_large_maps": args.allow_large_maps,
                     },
                     handle,
@@ -300,7 +407,7 @@ def main(argv: List[str] | None = None) -> int:
 
             if not args.skip_visualization or args.save_raw:
                 tokenizer = (
-                    getattr(pipe, config.tokenizer_attribute, None)
+                    text_tokenizers(pipe)
                     if not args.skip_visualization
                     else None
                 )
@@ -309,6 +416,7 @@ def main(argv: List[str] | None = None) -> int:
                     tokenizer=tokenizer,
                     prompts=[prompt],
                     images=generated_images,
+                    videos=generated_videos,
                     unconditional=None,
                     save_raw=args.save_raw,
                     save_visualizations=not args.skip_visualization,
@@ -317,6 +425,7 @@ def main(argv: List[str] | None = None) -> int:
                         max_items=max_visual_items,
                         save_layer_maps=args.save_layer_maps,
                         show_spatial_labels=args.show_spatial_labels,
+                        video_fps=args.fps or config.fps,
                     ),
                 )
             print(f"[{key}] ok: {maps.summary()}")
@@ -324,7 +433,7 @@ def main(argv: List[str] | None = None) -> int:
             failures.append((key, exc))
             print(f"[{key}] failed: {type(exc).__name__}: {exc}")
         finally:
-            del pipe, result, maps, capture, tokenizer, generated_images
+            del pipe, result, maps, capture, tokenizer, generated_images, generated_videos
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -336,6 +445,25 @@ def main(argv: List[str] | None = None) -> int:
             print(f"  {key}: {type(exc).__name__}: {exc}")
         return 1
     return 0
+
+
+def _video_batches(value):
+    from attention_map_diffusers.visualization import _as_pil_videos
+
+    return _as_pil_videos(value)
+
+
+def _save_video_gif(frames, path: str, fps: int) -> None:
+    if not frames:
+        return
+    frames[0].save(
+        path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=max(1, round(1000 / fps)),
+        loop=0,
+        optimize=False,
+    )
 
 
 if __name__ == "__main__":

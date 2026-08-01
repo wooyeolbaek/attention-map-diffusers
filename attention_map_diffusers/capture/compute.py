@@ -50,6 +50,13 @@ def compute_attention_probs(
             else:
                 logits = logits + mask
         probabilities = torch.softmax(logits, dim=-1).to(query.dtype)
+        if attention_mask is not None and mask.dtype == torch.bool:
+            # PyTorch SDPA returns an all-zero output for a query row whose
+            # boolean mask contains no valid keys. Softmax over the finite
+            # sentinel above would otherwise manufacture a uniform map for
+            # padded text-query rows that never participate in attention.
+            valid_query_rows = mask.any(dim=-1, keepdim=True)
+            probabilities = probabilities.masked_fill(~valid_query_rows, 0)
         if output_key_index is not None:
             probabilities = probabilities.index_select(-1, output_key_index)
         # Reduce before concatenating query chunks. For the common heads="mean"

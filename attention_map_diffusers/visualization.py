@@ -5,7 +5,7 @@ import math
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .capture.compute import require_torch
 from .capture.records import AttentionRecord, TokenGrid, parse_relation
@@ -33,6 +33,7 @@ class VisualizationConfig:
     save_overlays: bool = True
     show_spatial_labels: bool = False
     max_matrix_tokens: Optional[int] = 128
+    video_fps: int = 8
 
     def __post_init__(self) -> None:
         if self.spatial_long_side <= 0:
@@ -47,6 +48,8 @@ class VisualizationConfig:
             raise ValueError("overlay_alpha must be between 0 and 1.")
         if self.colormap not in _COLORMAPS:
             raise ValueError(f"Unknown colormap {self.colormap!r}; choose one of {sorted(_COLORMAPS)}.")
+        if self.video_fps <= 0:
+            raise ValueError("video_fps must be positive.")
 
 
 class AttentionVisualizer:
@@ -63,6 +66,7 @@ class AttentionVisualizer:
         tokenizer=None,
         prompts=None,
         images=None,
+        videos=None,
         relations: Optional[Sequence[str]] = None,
         unconditional: Optional[bool] = None,
     ) -> Dict[str, Any]:
@@ -70,12 +74,14 @@ class AttentionVisualizer:
         if relations is not None:
             relation_set = set(relations)
             records = [record for record in records if record.relation in relation_set]
+        records = _select_guidance_records(records, unconditional)
 
         output_root = Path(base_dir)
         output_root.mkdir(parents=True, exist_ok=True)
         resolver = _TokenResolver(tokenizer, prompts, records)
         source_images = _as_pil_images(images)
-        conditional_batch_count = len(source_images) or None
+        source_videos = _as_pil_videos(videos)
+        conditional_batch_count = len(source_images) or len(source_videos) or None
         manifest: Dict[str, Any] = {"relations": {}, "warnings": []}
 
         by_relation: Dict[str, List[AttentionRecord]] = {}
@@ -99,6 +105,7 @@ class AttentionVisualizer:
                         record_dir,
                         resolver=resolver,
                         source_images=source_images,
+                        source_videos=source_videos,
                     )
                     result.update({"index": record_index, "layer": record.layer_id, "step": record.step_index,
                                    "timestep": record.timestep})
@@ -118,6 +125,7 @@ class AttentionVisualizer:
                         aggregate_dir,
                         resolver=resolver,
                         source_images=source_images,
+                        source_videos=source_videos,
                         title_prefix=f"aggregate ({count} maps)",
                     )
                     result["source_records"] = count
@@ -136,6 +144,7 @@ class AttentionVisualizer:
         *,
         resolver: "_TokenResolver",
         source_images: Sequence[Any],
+        source_videos: Sequence[Sequence[Any]],
         title_prefix: Optional[str] = None,
     ) -> Dict[str, Any]:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -151,49 +160,78 @@ class AttentionVisualizer:
             map_dir.mkdir(parents=True, exist_ok=True)
             overlay_dir = batch_dir / "overlays"
             source = source_images[batch] if batch < len(source_images) else None
-            prefix = title_prefix or f"{relation} | {record.layer_id}"
+            source_video = source_videos[batch] if batch < len(source_videos) else []
+            prefix = _record_title(record, relation, title_prefix)
 
             if relation == "text->text":
-                positions_q, labels_q = resolver.axis(record, "query", batch, data.shape[1])
-                positions_k, labels_k = resolver.axis(record, "key", batch, data.shape[2])
-                positions_q, labels_q = _limit_axis(positions_q, labels_q, self.config.max_matrix_tokens)
-                positions_k, labels_k = _limit_axis(positions_k, labels_k, self.config.max_matrix_tokens)
-                matrix = _select_matrix(data[batch], positions_q, positions_k)
-                image = _render_text_matrix(matrix, labels_q, labels_k, prefix, self.config.colormap)
-                path = map_dir / "attention-matrix.png"
-                image.save(path)
-                files.append(str(path))
-                self._append_overview(batch_overviews, batch, "token × token", image)
+                for q_component, positions_q, labels_q in resolver.axes(
+                    record, "query", batch, data.shape[1]
+                ):
+                    for k_component, positions_k, labels_k in resolver.axes(
+                        record, "key", batch, data.shape[2]
+                    ):
+                        limited_q = _limit_axis(
+                            positions_q, labels_q, self.config.max_matrix_tokens
+                        )
+                        limited_k = _limit_axis(
+                            positions_k, labels_k, self.config.max_matrix_tokens
+                        )
+                        matrix = _select_matrix(data[batch], limited_q[0], limited_k[0])
+                        component_label = _component_pair(q_component, k_component)
+                        title = prefix if component_label is None else f"{prefix}\n{component_label}"
+                        image = _render_text_matrix(
+                            matrix, limited_q[1], limited_k[1], title, self.config.colormap
+                        )
+                        destination = map_dir
+                        if component_label is not None:
+                            destination = map_dir / _safe_component(component_label)
+                            destination.mkdir(parents=True, exist_ok=True)
+                        path = destination / "attention-matrix.png"
+                        image.save(path)
+                        files.append(str(path))
+                        self._append_overview(
+                            batch_overviews, batch, component_label or "token × token", image
+                        )
 
             elif relation == "image->text":
                 if not _is_full_grid(record.q_shape, data.shape[1], record.metadata.get("query_indices")):
                     warnings.append(_unsupported_warning(record, "image query axis cannot be reshaped to its grid"))
                     continue
-                positions, labels = resolver.axis(record, "key", batch, data.shape[2])
-                for data_position, label in _limited_items(positions, labels, self.config.max_items):
-                    spatial = data[batch, :, data_position].reshape(
-                        int(record.q_shape.height), int(record.q_shape.width)
+                for component, positions, labels in resolver.axes(record, "key", batch, data.shape[2]):
+                    component_maps, component_overlays = _component_dirs(
+                        map_dir, overlay_dir, component
                     )
-                    stem = f"token-{_safe_component(label, max_length=80)}"
-                    title = f"{prefix}\nkey token: {label}"
-                    rendered = self._save_spatial(spatial, map_dir, overlay_dir, stem, title, source)
-                    files.extend(rendered[0])
-                    self._append_overview(batch_overviews, batch, label, rendered[1])
+                    for data_position, label in _limited_items(positions, labels, self.config.max_items):
+                        spatial = data[batch, :, data_position].reshape(
+                            int(record.q_shape.height), int(record.q_shape.width)
+                        )
+                        stem = f"token-{_safe_component(label, max_length=80)}"
+                        title = f"{prefix}\nkey token: {label}"
+                        rendered = self._save_spatial(
+                            spatial, component_maps, component_overlays, stem, title, source
+                        )
+                        files.extend(rendered[0])
+                        self._append_overview(batch_overviews, batch, label, rendered[1])
 
             elif relation == "text->image":
                 if not _is_full_grid(record.k_shape, data.shape[2], record.metadata.get("key_indices")):
                     warnings.append(_unsupported_warning(record, "image key axis cannot be reshaped to its grid"))
                     continue
-                positions, labels = resolver.axis(record, "query", batch, data.shape[1])
-                for data_position, label in _limited_items(positions, labels, self.config.max_items):
-                    spatial = data[batch, data_position, :].reshape(
-                        int(record.k_shape.height), int(record.k_shape.width)
+                for component, positions, labels in resolver.axes(record, "query", batch, data.shape[1]):
+                    component_maps, component_overlays = _component_dirs(
+                        map_dir, overlay_dir, component
                     )
-                    stem = f"token-{_safe_component(label, max_length=80)}"
-                    title = f"{prefix}\nquery token: {label}"
-                    rendered = self._save_spatial(spatial, map_dir, overlay_dir, stem, title, source)
-                    files.extend(rendered[0])
-                    self._append_overview(batch_overviews, batch, label, rendered[1])
+                    for data_position, label in _limited_items(positions, labels, self.config.max_items):
+                        spatial = data[batch, data_position, :].reshape(
+                            int(record.k_shape.height), int(record.k_shape.width)
+                        )
+                        stem = f"token-{_safe_component(label, max_length=80)}"
+                        title = f"{prefix}\nquery token: {label}"
+                        rendered = self._save_spatial(
+                            spatial, component_maps, component_overlays, stem, title, source
+                        )
+                        files.extend(rendered[0])
+                        self._append_overview(batch_overviews, batch, label, rendered[1])
 
             elif relation == "image->image":
                 query_full = _is_full_grid(record.q_shape, data.shape[1], record.metadata.get("query_indices"))
@@ -228,6 +266,86 @@ class AttentionVisualizer:
                         )
                 else:
                     warnings.append(_unsupported_warning(record, "neither image axis contains a complete patch grid"))
+
+            elif relation == "video->text":
+                if not _is_full_grid(record.q_shape, data.shape[1], record.metadata.get("query_indices")):
+                    warnings.append(_unsupported_warning(record, "video query axis cannot be reshaped to T×H×W"))
+                    continue
+                for component, positions, labels in resolver.axes(record, "key", batch, data.shape[2]):
+                    component_maps, component_overlays = _component_dirs(
+                        map_dir, overlay_dir, component
+                    )
+                    for data_position, label in _limited_items(positions, labels, self.config.max_items):
+                        volume = data[batch, :, data_position].reshape(
+                            int(record.q_shape.frames or 1),
+                            int(record.q_shape.height),
+                            int(record.q_shape.width),
+                        )
+                        stem = f"token-{_safe_component(label, max_length=80)}"
+                        title = f"{prefix}\nkey token: {label}"
+                        rendered = self._save_video_spatial(
+                            volume, component_maps, component_overlays, stem, title, source_video
+                        )
+                        files.extend(rendered[0])
+                        self._append_overview(batch_overviews, batch, label, rendered[1])
+
+            elif relation == "text->video":
+                if not _is_full_grid(record.k_shape, data.shape[2], record.metadata.get("key_indices")):
+                    warnings.append(_unsupported_warning(record, "video key axis cannot be reshaped to T×H×W"))
+                    continue
+                for component, positions, labels in resolver.axes(record, "query", batch, data.shape[1]):
+                    component_maps, component_overlays = _component_dirs(
+                        map_dir, overlay_dir, component
+                    )
+                    for data_position, label in _limited_items(positions, labels, self.config.max_items):
+                        volume = data[batch, data_position, :].reshape(
+                            int(record.k_shape.frames or 1),
+                            int(record.k_shape.height),
+                            int(record.k_shape.width),
+                        )
+                        stem = f"token-{_safe_component(label, max_length=80)}"
+                        title = f"{prefix}\nquery token: {label}"
+                        rendered = self._save_video_spatial(
+                            volume, component_maps, component_overlays, stem, title, source_video
+                        )
+                        files.extend(rendered[0])
+                        self._append_overview(batch_overviews, batch, label, rendered[1])
+
+            elif relation == "video->video":
+                query_full = _is_full_grid(record.q_shape, data.shape[1], record.metadata.get("query_indices"))
+                key_full = _is_full_grid(record.k_shape, data.shape[2], record.metadata.get("key_indices"))
+                if key_full:
+                    positions, labels = _patch_axis(record, "query", data.shape[1])
+                    for data_position, label in _limited_items(positions, labels, self.config.max_items):
+                        volume = data[batch, data_position, :].reshape(
+                            int(record.k_shape.frames or 1),
+                            int(record.k_shape.height),
+                            int(record.k_shape.width),
+                        )
+                        stem = f"query-patch-{_safe_component(label)}"
+                        title = f"{prefix}\nquery patch: {label} → key video grid"
+                        rendered = self._save_video_spatial(
+                            volume, map_dir, overlay_dir, stem, title, source_video
+                        )
+                        files.extend(rendered[0])
+                        self._append_overview(batch_overviews, batch, f"query {label}", rendered[1])
+                elif query_full:
+                    positions, labels = _patch_axis(record, "key", data.shape[2])
+                    for data_position, label in _limited_items(positions, labels, self.config.max_items):
+                        volume = data[batch, :, data_position].reshape(
+                            int(record.q_shape.frames or 1),
+                            int(record.q_shape.height),
+                            int(record.q_shape.width),
+                        )
+                        stem = f"key-patch-{_safe_component(label)}"
+                        title = f"{prefix}\nattention received by key patch: {label}"
+                        rendered = self._save_video_spatial(
+                            volume, map_dir, overlay_dir, stem, title, source_video
+                        )
+                        files.extend(rendered[0])
+                        self._append_overview(batch_overviews, batch, f"key {label}", rendered[1])
+                else:
+                    warnings.append(_unsupported_warning(record, "neither video axis contains a complete T×H×W grid"))
             else:
                 warnings.append(_unsupported_warning(record, f"relation {relation!r} has no renderer"))
 
@@ -283,16 +401,104 @@ class AttentionVisualizer:
             overview_image = overlay
         return files, overview_image
 
+    def _save_video_spatial(
+        self,
+        volume,
+        map_dir: Path,
+        overlay_dir: Path,
+        stem: str,
+        title: str,
+        source_frames: Sequence[Any],
+    ):
+        frame_root = map_dir / stem / "frames"
+        frame_root.mkdir(parents=True, exist_ok=True)
+        rendered_frames = []
+        files = []
+        minimum, maximum = volume.detach().float().amin(), volume.detach().float().amax()
+        for frame_index, spatial in enumerate(volume):
+            heatmap, _ = _render_spatial_map(
+                spatial,
+                f"{title}\nframe: {frame_index}",
+                colormap=self.config.colormap,
+                long_side=self.config.spatial_long_side,
+                show_labels=self.config.show_spatial_labels,
+                value_range=(minimum, maximum),
+            )
+            path = frame_root / f"frame-{frame_index:04d}.png"
+            heatmap.save(path)
+            files.append(str(path))
+            rendered_frames.append(heatmap)
+        animation_path = map_dir / f"{stem}.gif"
+        _save_gif(rendered_frames, animation_path, self.config.video_fps)
+        files.append(str(animation_path))
+        overview = rendered_frames[len(rendered_frames) // 2]
+
+        if source_frames and self.config.save_overlays:
+            overlay_root = overlay_dir / stem / "frames"
+            overlay_root.mkdir(parents=True, exist_ok=True)
+            aligned = _resize_video_volume(volume, len(source_frames))
+            overlay_frames = []
+            for frame_index, (spatial, source) in enumerate(zip(aligned, source_frames)):
+                _, raw = _render_spatial_map(
+                    spatial,
+                    title,
+                    colormap=self.config.colormap,
+                    long_side=self.config.spatial_long_side,
+                    show_labels=False,
+                    value_range=(minimum, maximum),
+                )
+                overlay = _render_overlay(
+                    source,
+                    raw,
+                    f"{title}\nframe: {frame_index}",
+                    self.config.overlay_alpha,
+                    self.config.spatial_long_side,
+                    self.config.show_spatial_labels,
+                )
+                path = overlay_root / f"frame-{frame_index:04d}.png"
+                overlay.save(path)
+                files.append(str(path))
+                overlay_frames.append(overlay)
+            overlay_animation = overlay_dir / f"{stem}.gif"
+            _save_gif(overlay_frames, overlay_animation, self.config.video_fps)
+            files.append(str(overlay_animation))
+            overview = overlay_frames[len(overlay_frames) // 2]
+        return files, overview
+
 
 class _TokenResolver:
     def __init__(self, tokenizer, prompts, records: Sequence[AttentionRecord]):
         self.groups: List[Dict[str, Any]] = []
+        self.component_groups: Dict[str, List[Dict[str, Any]]] = {}
         if tokenizer is None or prompts is None:
             return
         prompt_list = [prompts] if isinstance(prompts, str) else list(prompts)
         max_length = max((_text_length(record) for record in records), default=0)
         if max_length <= 0:
             return
+
+        if isinstance(tokenizer, Mapping):
+            for component in _text_component_specs(records):
+                name = str(component.get("name", "text"))
+                component_tokenizer = tokenizer.get(name)
+                if component_tokenizer is None:
+                    continue
+                component_length = _component_token_length(component)
+                self.component_groups[name] = self._encode_groups(
+                    component_tokenizer,
+                    prompt_list,
+                    max(1, component_length),
+                )
+            fallback = tokenizer.get("text") or next(iter(tokenizer.values()), None)
+            if fallback is not None:
+                self.groups = self._encode_groups(fallback, prompt_list, max_length)
+            return
+
+        self.groups = self._encode_groups(tokenizer, prompt_list, max_length)
+
+    @staticmethod
+    def _encode_groups(tokenizer, prompt_list, max_length):
+        groups = []
 
         try:
             encoded = tokenizer(
@@ -309,9 +515,10 @@ class _TokenResolver:
                 labels = [_display_token(token, index) for index, token in enumerate(raw_tokens)]
                 mask = masks[batch] if batch < len(masks) else [1] * len(labels)
                 active = {index for index, value in enumerate(mask) if int(value)}
-                self.groups.append({"labels": labels, "active": active})
+                groups.append({"labels": labels, "active": active})
         except Exception:
-            self.groups = []
+            return []
+        return groups
 
     def axis(self, record: AttentionRecord, axis: str, batch: int, length: int):
         selected = record.metadata.get(f"{axis}_indices")
@@ -334,6 +541,104 @@ class _TokenResolver:
             ]
         return [item[0] for item in filtered], [item[1] for item in filtered]
 
+    def axes(self, record: AttentionRecord, axis: str, batch: int, length: int):
+        query_name, key_name = parse_relation(record.relation)
+        modality = query_name if axis == "query" else key_name
+        components = record.metadata.get("text_components")
+        if modality != "text" or not components:
+            positions, labels = self.axis(record, axis, batch, length)
+            return [(None, positions, labels)]
+
+        selected = record.metadata.get(f"{axis}_indices")
+        original_indices = list(range(length)) if selected is None else [int(item) for item in selected][:length]
+        position_by_original = {original: position for position, original in enumerate(original_indices)}
+        axes = []
+        for component in components:
+            indices_by_batch = component.get("indices_by_batch") or []
+            token_indices_by_batch = component.get("token_indices_by_batch") or []
+            if not indices_by_batch:
+                continue
+            component_indices = indices_by_batch[min(batch, len(indices_by_batch) - 1)]
+            token_indices = (
+                token_indices_by_batch[min(batch, len(token_indices_by_batch) - 1)]
+                if token_indices_by_batch
+                else list(range(len(component_indices)))
+            )
+            name = str(component.get("name", "text"))
+            group_list = self.component_groups.get(name, [])
+            group = group_list[min(batch, len(group_list) - 1)] if group_list else None
+            positions = []
+            labels = []
+            for original, token_index in zip(component_indices, token_indices):
+                if int(original) not in position_by_original:
+                    continue
+                if group is not None and int(token_index) not in group["active"]:
+                    continue
+                positions.append(position_by_original[int(original)])
+                if group is not None and 0 <= int(token_index) < len(group["labels"]):
+                    token_label = group["labels"][int(token_index)]
+                else:
+                    token_label = f"{int(token_index)}:token"
+                labels.append(f"{name}/{token_label}")
+            if positions:
+                axes.append((name, positions, labels))
+        if axes:
+            return axes
+        positions, labels = self.axis(record, axis, batch, length)
+        return [(None, positions, labels)]
+
+
+def _text_component_specs(records: Sequence[AttentionRecord]):
+    seen = set()
+    result = []
+    for record in records:
+        for component in record.metadata.get("text_components") or []:
+            name = str(component.get("name", "text"))
+            if name in seen:
+                continue
+            seen.add(name)
+            result.append(component)
+    return result
+
+
+def _component_token_length(component: Dict[str, Any]) -> int:
+    values = [
+        int(index)
+        for batch_indices in component.get("token_indices_by_batch") or []
+        for index in batch_indices
+    ]
+    if values:
+        return max(values) + 1
+    length = component.get("length")
+    return int(length) if length is not None else 1
+
+
+def _component_dirs(map_dir: Path, overlay_dir: Path, component: Optional[str]):
+    if component is None:
+        return map_dir, overlay_dir
+    slug = _safe_component(component)
+    component_map_dir = map_dir / slug
+    component_map_dir.mkdir(parents=True, exist_ok=True)
+    return component_map_dir, overlay_dir / slug
+
+
+def _component_pair(query_component: Optional[str], key_component: Optional[str]):
+    if query_component is None and key_component is None:
+        return None
+    return f"{query_component or 'text'}-to-{key_component or 'text'}"
+
+
+def _record_title(
+    record: AttentionRecord,
+    relation: str,
+    title_prefix: Optional[str],
+) -> str:
+    # A text matrix already communicates that it is the aggregate view through
+    # its output path. Keep the rendered figure itself publication-clean.
+    if relation == "text->text" and record.layer_id == "aggregate":
+        return relation
+    return title_prefix or f"{relation} | {record.layer_id}"
+
 
 def _prepare_data(data, unconditional: Optional[bool], conditional_batch_count: Optional[int] = None):
     if data is None or data.ndim != 4:
@@ -345,6 +650,24 @@ def _prepare_data(data, unconditional: Optional[bool], conditional_batch_count: 
     if select_conditional and data.shape[0] % 2 == 0:
         data = data.chunk(2, dim=0)[1]
     return data
+
+
+def _select_guidance_records(
+    records: Sequence[AttentionRecord], unconditional: Optional[bool]
+) -> List[AttentionRecord]:
+    """Keep conditional records when a pipeline evaluates CFG in separate calls.
+
+    ``unconditional=False`` retains the legacy opt-out behavior and renders all
+    calls. Raw tensors and metadata are unaffected because this selection is
+    visualization-only.
+    """
+    records = list(records)
+    if unconditional is False:
+        return records
+    roles = {record.metadata.get("guidance_role") for record in records}
+    if "conditional" not in roles or not any(role != "conditional" for role in roles):
+        return records
+    return [record for record in records if record.metadata.get("guidance_role") == "conditional"]
 
 
 def _aggregate_compatible(
@@ -406,9 +729,13 @@ def _aggregate_spatial(prepared: Sequence[Tuple[AttentionRecord, Any]]):
     spatial_axis = None
     if relation == "image->text":
         spatial_axis = "query"
+    elif relation == "video->text":
+        spatial_axis = "query"
     elif relation == "text->image":
         spatial_axis = "key"
-    elif relation == "image->image":
+    elif relation == "text->video":
+        spatial_axis = "key"
+    elif relation in {"image->image", "video->video"}:
         # The normal per-query-patch view requires a full key grid. Fall back
         # to the inverse view only when capture selected key patches instead.
         if any(_record_has_full_grid(record, data, "key") for record, data in prepared):
@@ -455,11 +782,13 @@ def _aggregate_spatial(prepared: Sequence[Tuple[AttentionRecord, Any]]):
     else:
         k_shape = target_grid
         k_range = (k_range[0], k_range[0] + target_tokens)
-        if relation == "image->image" and metadata.get("query_indices") is not None:
+        if relation in {"image->image", "video->video"} and metadata.get("query_indices") is not None:
             # Each source record selected the center of its own grid. Label the
             # aggregate using the corresponding center on the target grid.
             if len(metadata["query_indices"]) == 1:
-                center = (int(target_grid.height) // 2) * int(target_grid.width)
+                center = ((int(target_grid.frames or 1) // 2) * int(target_grid.height))
+                center += int(target_grid.height) // 2
+                center *= int(target_grid.width)
                 center += int(target_grid.width) // 2
                 metadata["query_indices"] = (center,)
                 q_shape = target_grid
@@ -493,27 +822,37 @@ def _grid_for_axis(record: AttentionRecord, axis: str):
 
 
 def _resize_spatial_axis(data, source_grid: TokenGrid, target_grid: TokenGrid, axis: str):
-    if source_grid.height == target_grid.height and source_grid.width == target_grid.width:
+    if (
+        source_grid.frames == target_grid.frames
+        and source_grid.height == target_grid.height
+        and source_grid.width == target_grid.width
+    ):
         return data
     import torch.nn.functional as functional
 
     batch = int(data.shape[0])
+    source_frames = int(source_grid.frames or 1)
+    target_frames = int(target_grid.frames or 1)
     if axis == "query":
         other = int(data.shape[2])
-        maps = data.transpose(1, 2).reshape(batch, other, int(source_grid.height), int(source_grid.width))
+        maps = data.transpose(1, 2).reshape(
+            batch, other, source_frames, int(source_grid.height), int(source_grid.width)
+        )
         maps = functional.interpolate(
             maps,
-            size=(int(target_grid.height), int(target_grid.width)),
-            mode="bilinear",
+            size=(target_frames, int(target_grid.height), int(target_grid.width)),
+            mode="trilinear",
             align_corners=False,
         )
         return maps.flatten(2).transpose(1, 2)
     other = int(data.shape[1])
-    maps = data.reshape(batch, other, int(source_grid.height), int(source_grid.width))
+    maps = data.reshape(
+        batch, other, source_frames, int(source_grid.height), int(source_grid.width)
+    )
     maps = functional.interpolate(
         maps,
-        size=(int(target_grid.height), int(target_grid.width)),
-        mode="bilinear",
+        size=(target_frames, int(target_grid.height), int(target_grid.width)),
+        mode="trilinear",
         align_corners=False,
     )
     return maps.flatten(2)
@@ -559,6 +898,7 @@ def _render_spatial_map(
     colormap: str,
     long_side: int,
     show_labels: bool,
+    value_range=None,
 ):
     from PIL import Image, ImageDraw
 
@@ -569,7 +909,9 @@ def _render_spatial_map(
     else:
         width = long_side
         height = max(1, round(long_side * grid_h / grid_w))
-    raw = _colorize(spatial, colormap).resize((width, height), Image.Resampling.NEAREST)
+    raw = _colorize(spatial, colormap, value_range=value_range).resize(
+        (width, height), Image.Resampling.NEAREST
+    )
     if not show_labels:
         return raw, raw
 
@@ -635,12 +977,12 @@ def _make_overview(items: Sequence[Tuple[str, Any]], columns: int):
     return canvas
 
 
-def _colorize(tensor, colormap: str):
+def _colorize(tensor, colormap: str, value_range=None):
     from PIL import Image
 
     torch = require_torch()
     values = torch.nan_to_num(tensor.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
-    minimum, maximum = values.amin(), values.amax()
+    minimum, maximum = value_range if value_range is not None else (values.amin(), values.amax())
     values = (values - minimum) / (maximum - minimum).clamp_min(1e-8)
     anchors = torch.tensor(_COLORMAPS[colormap], dtype=torch.float32, device=values.device)
     scaled = values * (anchors.shape[0] - 1)
@@ -659,8 +1001,13 @@ def _patch_axis(record: AttentionRecord, axis: str, length: int):
     labels = []
     for index in indices:
         if grid is not None and grid.width is not None:
-            row, col = divmod(index, int(grid.width))
-            labels.append(f"{index:05d}-y{row:03d}-x{col:03d}")
+            frame_size = int(grid.height or 1) * int(grid.width)
+            frame, spatial_index = divmod(index, frame_size)
+            row, col = divmod(spatial_index, int(grid.width))
+            if (grid.frames or 1) > 1:
+                labels.append(f"{index:05d}-t{frame:03d}-y{row:03d}-x{col:03d}")
+            else:
+                labels.append(f"{index:05d}-y{row:03d}-x{col:03d}")
         else:
             labels.append(f"{index:05d}")
     return list(range(len(indices))), labels
@@ -672,7 +1019,7 @@ def _is_full_grid(grid: Optional[TokenGrid], data_length: int, selection) -> boo
         and grid.height is not None
         and grid.width is not None
         and selection is None
-        and data_length == int(grid.height) * int(grid.width)
+        and data_length == int(grid.spatial_tokens)
     )
 
 
@@ -732,19 +1079,96 @@ def _as_pil_images(images) -> List[Any]:
     if hasattr(images, "images"):
         images = images.images
     try:
-        from PIL import Image
-        import numpy as np
-
         result = []
         for image in images:
-            if hasattr(image, "convert"):
-                result.append(image)
-            else:
-                array = image.detach().cpu().numpy() if hasattr(image, "detach") else np.asarray(image)
-                result.append(Image.fromarray(array))
+            result.append(_to_pil_frame(image))
         return result
     except Exception:
         return []
+
+
+def _as_pil_videos(videos) -> List[List[Any]]:
+    if videos is None:
+        return []
+    if hasattr(videos, "frames"):
+        videos = videos.frames
+    try:
+        import numpy as np
+
+        if hasattr(videos, "detach"):
+            videos = videos.detach().cpu().numpy()
+        if isinstance(videos, np.ndarray):
+            if videos.ndim == 4:
+                videos = [videos]
+            elif videos.ndim != 5:
+                return []
+        else:
+            videos = list(videos)
+            if not videos:
+                return []
+            first = videos[0]
+            first_array = (
+                first.detach().cpu().numpy() if hasattr(first, "detach") else np.asarray(first)
+            )
+            if hasattr(first, "convert") or first_array.ndim == 3:
+                videos = [videos]
+
+        result = []
+        for video in videos:
+            frames = list(video) if not hasattr(video, "detach") else list(video.detach().cpu())
+            converted = [_to_pil_frame(frame) for frame in frames]
+            if converted:
+                result.append(converted)
+        return result
+    except Exception:
+        return []
+
+
+def _to_pil_frame(frame):
+    if hasattr(frame, "convert"):
+        return frame.convert("RGB")
+    import numpy as np
+    from PIL import Image
+
+    array = frame.detach().cpu().numpy() if hasattr(frame, "detach") else np.asarray(frame)
+    if array.ndim == 3 and array.shape[0] in {1, 3, 4} and array.shape[-1] not in {1, 3, 4}:
+        array = np.moveaxis(array, 0, -1)
+    if np.issubdtype(array.dtype, np.floating):
+        array = np.nan_to_num(array, nan=0.0, posinf=1.0, neginf=0.0)
+        if array.max(initial=0.0) <= 1.0:
+            array = array * 255.0
+    array = np.clip(array, 0, 255).round().astype(np.uint8)
+    if array.shape[-1] == 1:
+        array = array[..., 0]
+    return Image.fromarray(array).convert("RGB")
+
+
+def _resize_video_volume(volume, frames: int):
+    if int(volume.shape[0]) == frames:
+        return volume
+    import torch.nn.functional as functional
+
+    resized = functional.interpolate(
+        volume.detach().float()[None, None],
+        size=(frames, int(volume.shape[-2]), int(volume.shape[-1])),
+        mode="trilinear",
+        align_corners=False,
+    )
+    return resized[0, 0].to(volume.dtype)
+
+
+def _save_gif(frames: Sequence[Any], path: Path, fps: int) -> None:
+    if not frames:
+        return
+    duration = max(1, round(1000 / fps))
+    frames[0].save(
+        path,
+        save_all=True,
+        append_images=list(frames[1:]),
+        duration=duration,
+        loop=0,
+        optimize=False,
+    )
 
 
 def _font(size: int):
@@ -782,7 +1206,13 @@ def _safe_component(value: Any, max_length: int = 140) -> str:
 
 
 def _grid_tuple(grid: Optional[TokenGrid]):
-    return None if grid is None else (grid.frames, grid.height, grid.width, grid.patch_size)
+    return None if grid is None else (
+        grid.frames,
+        grid.height,
+        grid.width,
+        grid.patch_size,
+        grid.temporal_patch_size,
+    )
 
 
 def _unsupported_warning(record: AttentionRecord, reason: str) -> str:

@@ -44,22 +44,6 @@ SUCCESS_PROFILES = {
         },
         "offload": "cpu",
     },
-    "stream-last": {
-        "mode": "stream",
-        "capture_timesteps": "last",
-        "visualizations": True,
-        "raw_tensors": False,
-        "save_layer_maps": False,
-        "relations": "all",
-        "options": {
-            "steps": 2, "height": 256, "width": 256, "seed": 123,
-            "heads": [0], "query_indices": "all", "key_indices": "all",
-            "large_relation_query_indices": "0,1", "large_relation_key_indices": "all",
-            "max_visual_items": 2, "spatial_long_side": 160,
-            "max_map_elements": 128_000_000, "allow_large_maps": False,
-        },
-        "offload": "cuda",
-    },
     "keypatch-visual": {
         "mode": "fast",
         "capture_timesteps": "last",
@@ -99,16 +83,18 @@ def _json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _verify_png(path: Path, issues: list[str]) -> None:
+def _verify_image(path: Path, issues: list[str]) -> None:
     try:
         with Image.open(path) as image:
             image.verify()
     except Exception as exc:
-        issues.append(f"invalid PNG {path}: {type(exc).__name__}: {exc}")
+        issues.append(f"invalid image {path}: {type(exc).__name__}: {exc}")
 
 
 def _expected_relations(key: str, profile: dict) -> set[str]:
     relations = profile["relations"]
+    if relations == ["image->image"] and MODEL_CONFIGS[key].modality == "video":
+        return {"video->video"}
     return set(MODEL_CONFIGS[key].relations if relations == "all" else relations)
 
 
@@ -143,10 +129,17 @@ def validate_success_profile(root: Path, profile_name: str, key: str) -> dict:
 
     attention_root = model_root / "attention"
     if not expected["visualizations"]:
-        if list((model_root / "generated").glob("*.png")):
-            issues.append("--skip-visualization unexpectedly decoded a generated PNG")
+        if list((model_root / "generated").rglob("*.png")) or list(
+            (model_root / "generated").glob("*.gif")
+        ):
+            issues.append("--skip-visualization unexpectedly decoded generated media")
         metadata_path = attention_root / "metadata.json"
-        raw_files = sorted(attention_root.rglob("*.pt")) if attention_root.exists() else []
+        raw_files = sorted((attention_root / "raw").rglob("*.pt")) if attention_root.exists() else []
+        component_raw_files = (
+            sorted((attention_root / "raw-components").rglob("*.pt"))
+            if attention_root.exists()
+            else []
+        )
         if expected["raw_tensors"]:
             if not metadata_path.is_file():
                 issues.append("--save-raw with skipped PNGs did not write metadata")
@@ -156,6 +149,8 @@ def validate_success_profile(root: Path, profile_name: str, key: str) -> dict:
                     issues.append(f"raw tensor count={len(raw_files)}, records={len(metadata['records'])}")
                 if set(metadata["summary"]["relations"]) != expected_relations:
                     issues.append("skipped-visualization metadata relation mismatch")
+                if metadata["summary"].get("text_components") and not component_raw_files:
+                    issues.append("token-concatenated text components were not saved separately")
                 if any(
                     len(record["metadata"].get("query_indices", [])) != 1
                     or not (1 <= len(record["metadata"].get("key_indices", [])) <= 3)
@@ -181,6 +176,7 @@ def validate_success_profile(root: Path, profile_name: str, key: str) -> dict:
             "issues": issues,
             "records": sum(item.get("records", 0) for item in tensor_validation.get("relations", {}).values()),
             "raw_files": len(raw_files),
+            "component_raw_files": len(component_raw_files),
         }
 
     metadata_path = attention_root / "metadata.json"
@@ -192,18 +188,23 @@ def validate_success_profile(root: Path, profile_name: str, key: str) -> dict:
     manifest = _json(manifest_path)
     if set(metadata["summary"]["relations"]) != expected_relations:
         issues.append("attention metadata relation mismatch")
-    image_records = [record for record in metadata["records"] if record["relation"] == "image->image"]
-    if image_records:
-        expected_query_count = {"fast-last": 3, "exact-all-layer-raw": 1, "stream-last": 2}.get(profile_name)
+    spatial_relation = "video->video" if MODEL_CONFIGS[key].modality == "video" else "image->image"
+    spatial_records = [
+        record for record in metadata["records"] if record["relation"] == spatial_relation
+    ]
+    if spatial_records:
+        expected_query_count = {"fast-last": 3, "exact-all-layer-raw": 1}.get(profile_name)
         if expected_query_count is not None and any(
             len(record["metadata"].get("query_indices", [])) != expected_query_count
-            for record in image_records
+            for record in spatial_records
         ):
-            issues.append(f"image->image query selection did not retain {expected_query_count} patches")
+            issues.append(
+                f"{spatial_relation} query selection did not retain {expected_query_count} patches"
+            )
         if profile_name == "keypatch-visual" and any(
-            len(record["metadata"].get("key_indices", [])) != 3 for record in image_records
+            len(record["metadata"].get("key_indices", [])) != 3 for record in spatial_records
         ):
-            issues.append("image->image key selection did not retain 3 patches")
+            issues.append(f"{spatial_relation} key selection did not retain 3 patches")
     if manifest.get("warnings"):
         issues.extend(f"visualizer warning: {warning}" for warning in manifest["warnings"])
 
@@ -217,10 +218,13 @@ def validate_success_profile(root: Path, profile_name: str, key: str) -> dict:
     elif timestep_count != 1:
         issues.append(f"last-timestep profile retained {timestep_count} timesteps, expected 1")
 
-    raw_files = sorted(attention_root.rglob("*.pt"))
+    raw_files = sorted((attention_root / "raw").rglob("*.pt"))
+    component_raw_files = sorted((attention_root / "raw-components").rglob("*.pt"))
     if expected["raw_tensors"]:
         if len(raw_files) != len(metadata["records"]):
             issues.append(f"raw tensor count={len(raw_files)}, records={len(metadata['records'])}")
+        if metadata["summary"].get("text_components") and not component_raw_files:
+            issues.append("token-concatenated text components were not saved separately")
         sampled_relations = set()
         for path in raw_files:
             relation = path.parent.name
@@ -262,23 +266,38 @@ def validate_success_profile(root: Path, profile_name: str, key: str) -> dict:
     for path in dict.fromkeys(visual_files):
         if not path.is_file():
             issues.append(f"missing visualization file {path}")
-        elif path.suffix.lower() == ".png":
-            _verify_png(path, issues)
-        if path.parent.name == "maps" and "overlays" in path.parts:
+        elif path.suffix.lower() in {".png", ".gif"}:
+            _verify_image(path, issues)
+        if "maps" in path.parts and "overlays" in path.parts:
             issues.append(f"overlay leaked into maps directory: {path}")
 
-    generated = sorted((model_root / "generated").glob("*.png"))
-    if len(generated) != 1:
-        issues.append(f"expected one generated PNG, found {len(generated)}")
+    config = MODEL_CONFIGS[key]
+    if config.modality == "video":
+        generated = sorted((model_root / "generated").glob("*.gif"))
+        frame_dirs = [path for path in (model_root / "generated").iterdir() if path.is_dir()]
+        if len(generated) != 1 or len(frame_dirs) != 1 or not list(frame_dirs[0].glob("frame-*.png")):
+            issues.append("expected one generated GIF and one non-empty frame directory")
+        else:
+            _verify_image(generated[0], issues)
+            for path in frame_dirs[0].glob("frame-*.png"):
+                _verify_image(path, issues)
     else:
-        _verify_png(generated[0], issues)
+        generated = sorted((model_root / "generated").glob("*.png"))
+        if len(generated) != 1:
+            issues.append(f"expected one generated PNG, found {len(generated)}")
+        else:
+            _verify_image(generated[0], issues)
 
     if profile_name == "keypatch-visual":
-        batch = attention_root / "visuals" / "image-to-image" / "aggregate" / "batch-000"
-        maps = sorted((batch / "maps").glob("key-patch-*.png"))
-        overlays = sorted((batch / "overlays").glob("key-patch-*.png"))
+        slug = spatial_relation.replace("->", "-to-")
+        batch = attention_root / "visuals" / slug / "aggregate" / "batch-000"
+        extension = ".gif" if config.modality == "video" else ".png"
+        maps = sorted((batch / "maps").glob(f"key-patch-*{extension}"))
+        overlays = sorted((batch / "overlays").glob(f"key-patch-*{extension}"))
         if len(maps) != 2 or len(overlays) != 2:
-            issues.append(f"selected key-patch maps/overlays={len(maps)}/{len(overlays)}, expected=2/2")
+            issues.append(
+                f"selected key-patch maps/overlays={len(maps)}/{len(overlays)}, expected=2/2"
+            )
 
     return {
         "status": "pass" if not issues else "fail",
@@ -286,6 +305,7 @@ def validate_success_profile(root: Path, profile_name: str, key: str) -> dict:
         "records": len(metadata["records"]),
         "timesteps": timestep_count,
         "raw_files": len(raw_files),
+        "component_raw_files": len(component_raw_files),
         "visual_files": len(set(visual_files)),
     }
 
@@ -293,17 +313,28 @@ def validate_success_profile(root: Path, profile_name: str, key: str) -> dict:
 def validate_parity(root: Path, key: str) -> dict:
     arrays = {}
     issues = []
-    for profile in ("fast-last", "exact-all-layer-raw", "stream-last"):
-        files = sorted((root / profile / key / "generated").glob("*.png"))
-        if len(files) != 1:
-            issues.append(f"{profile}: generated PNG missing")
-            continue
-        with Image.open(files[0]) as image:
-            arrays[profile] = np.asarray(image.convert("RGB"))
+    for profile in ("fast-last", "exact-all-layer-raw"):
+        generated_root = root / profile / key / "generated"
+        if MODEL_CONFIGS[key].modality == "video":
+            frame_dirs = [path for path in generated_root.iterdir() if path.is_dir()]
+            files = sorted(frame_dirs[0].glob("frame-*.png")) if len(frame_dirs) == 1 else []
+            if not files:
+                issues.append(f"{profile}: generated video frames missing")
+                continue
+            arrays[profile] = np.stack(
+                [np.asarray(Image.open(path).convert("RGB")) for path in files]
+            )
+        else:
+            files = sorted(generated_root.glob("*.png"))
+            if len(files) != 1:
+                issues.append(f"{profile}: generated PNG missing")
+                continue
+            with Image.open(files[0]) as image:
+                arrays[profile] = np.asarray(image.convert("RGB"))
     maximum = 0
-    if len(arrays) == 3:
+    if len(arrays) == 2:
         baseline = arrays["fast-last"].astype(np.int16)
-        for profile in ("exact-all-layer-raw", "stream-last"):
+        for profile in ("exact-all-layer-raw",):
             if arrays[profile].shape != baseline.shape:
                 issues.append(f"{profile}: generated shape differs from fast mode")
                 continue

@@ -120,21 +120,28 @@ def validate_model(model_dir: Path, expected_relations: Iterable[str]) -> Dict[s
             error = float((row_mass - 1.0).abs().max())
             stats["row_sum_max_error"] = max(stats["row_sum_max_error"], error)
 
-    joint_errors = {"image_query": 0.0, "text_query": 0.0, "groups": 0}
+    spatial_name = "video" if any(relation.startswith("video->") for relation in expected_relations) else "image"
+    joint_errors = {f"{spatial_name}_query": 0.0, "text_query": 0.0, "groups": 0}
     if len(expected_relations) == 4:
-        required = {"image->text", "text->image", "image->image", "text->text"}
+        spatial_text = f"{spatial_name}->text"
+        text_spatial = f"text->{spatial_name}"
+        spatial_spatial = f"{spatial_name}->{spatial_name}"
+        required = {spatial_text, text_spatial, spatial_spatial, "text->text"}
         for group in grouped_masses.values():
             if not required.issubset(group):
                 continue
-            image_index = group["image->image"]["query_indices"]
-            if not image_index or len(image_index) != 1:
-                issues.append("joint image->image record did not contain one selected query patch")
+            spatial_index = group[spatial_spatial]["query_indices"]
+            if not spatial_index or len(spatial_index) != 1:
+                issues.append(
+                    f"joint {spatial_spatial} record did not contain one selected query patch"
+                )
                 continue
-            image_text_mass = group["image->text"]["mass"][..., int(image_index[0])]
-            image_mass = image_text_mass + group["image->image"]["mass"][..., 0]
-            text_mass = group["text->image"]["mass"] + group["text->text"]["mass"]
-            joint_errors["image_query"] = max(
-                joint_errors["image_query"], float((image_mass - 1.0).abs().max())
+            spatial_text_mass = group[spatial_text]["mass"][..., int(spatial_index[0])]
+            spatial_mass = spatial_text_mass + group[spatial_spatial]["mass"][..., 0]
+            text_mass = group[text_spatial]["mass"] + group["text->text"]["mass"]
+            joint_errors[f"{spatial_name}_query"] = max(
+                joint_errors[f"{spatial_name}_query"],
+                float((spatial_mass - 1.0).abs().max()),
             )
             joint_errors["text_query"] = max(
                 joint_errors["text_query"], float((text_mass - 1.0).abs().max())
@@ -178,11 +185,14 @@ def validate_model(model_dir: Path, expected_relations: Iterable[str]) -> Dict[s
             "image->image": "query-patch-",
             "image->text": "token-",
             "text->image": "token-",
+            "video->video": "query-patch-",
+            "video->text": "token-",
+            "text->video": "token-",
         }[relation]
         if not any(expected_fragment in name for name in names):
             issues.append(f"{relation}: expected visual type {expected_fragment!r} not found")
-        if relation != "text->text" and not any(path.parent.name == "overlays" for path in files):
-            issues.append(f"{relation}: no generated-image overlay")
+        if relation != "text->text" and not any("overlays" in path.parts for path in files):
+            issues.append(f"{relation}: no generated-media overlay")
         if any("batch-001" in str(path) for path in files):
             issues.append(f"{relation}: unconditional CFG batch leaked into aggregate visuals")
         for path in files:
@@ -194,17 +204,29 @@ def validate_model(model_dir: Path, expected_relations: Iterable[str]) -> Dict[s
             except Exception as exc:
                 issues.append(f"{relation}: invalid PNG {path.name}: {exc}")
 
-    generated = sorted((model_dir / "generated").glob("*.png"))
-    if not generated:
-        issues.append("missing generated image")
-        generated_size = None
+    generated_root = model_dir / "generated"
+    if spatial_name == "video":
+        frame_dirs = [path for path in generated_root.iterdir() if path.is_dir()] if generated_root.is_dir() else []
+        generated = sorted(frame_dirs[0].glob("frame-*.png")) if len(frame_dirs) == 1 else []
+        if not generated:
+            issues.append("missing generated video frames")
+            generated_size = None
+        else:
+            with Image.open(generated[0]) as image:
+                generated_size = [len(generated), *image.size]
+                image.verify()
     else:
-        with Image.open(generated[0]) as image:
-            generated_size = list(image.size)
-            image.verify()
+        generated = sorted(generated_root.glob("*.png"))
+        if not generated:
+            issues.append("missing generated image")
+            generated_size = None
+        else:
+            with Image.open(generated[0]) as image:
+                generated_size = list(image.size)
+                image.verify()
 
     if len(expected_relations) == 4:
-        if joint_errors["image_query"] > 0.02 or joint_errors["text_query"] > 0.02:
+        if joint_errors[f"{spatial_name}_query"] > 0.02 or joint_errors["text_query"] > 0.02:
             issues.append(f"joint relation mass error: {joint_errors}")
 
     return {

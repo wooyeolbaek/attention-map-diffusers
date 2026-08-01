@@ -21,6 +21,7 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=256)
+    parser.add_argument("--num-frames", type=int, default=9)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path, default=Path("generation-parity.json"))
     args = parser.parse_args()
@@ -54,22 +55,32 @@ def main() -> int:
                 call_kwargs["guidance_scale"] = config.guidance_scale
 
             prompt = config.prompt
-            baseline = pipe(
+            if config.modality == "video":
+                call_kwargs["num_frames"] = args.num_frames
+
+            relation = "video->text" if config.modality == "video" else "image->text"
+            baseline_output = pipe(
                 prompt=[prompt], generator=_generator(torch, args.device, args.seed), **call_kwargs
-            ).images.detach().float()
+            )
+            baseline = torch.as_tensor(
+                baseline_output.frames if config.modality == "video" else baseline_output.images
+            ).detach().float()
 
             with AttentionCapture(
                 pipe,
-                relations=["image->text"],
+                relations=[relation],
                 mode="exact",
                 heads="mean",
                 offload="cpu",
-                relation_query_indices={"image->text": "center"},
-                relation_key_indices={"image->text": (0,)},
+                relation_query_indices={relation: "center"},
+                relation_key_indices={relation: (0,)},
             ) as capture:
-                captured = pipe(
+                captured_output = pipe(
                     prompt=[prompt], generator=_generator(torch, args.device, args.seed), **call_kwargs
-                ).images.detach().float()
+                )
+                captured = torch.as_tensor(
+                    captured_output.frames if config.modality == "video" else captured_output.images
+                ).detach().float()
 
             difference = (baseline - captured).abs()
             max_abs = float(difference.max())

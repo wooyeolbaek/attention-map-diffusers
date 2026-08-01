@@ -11,11 +11,16 @@ from .records import AttentionLayout, AttentionRecord, iter_supported_relations
 
 
 class AttentionCollector:
-    def __init__(self, config: CaptureConfig):
+    def __init__(self, config: CaptureConfig, metadata: Optional[Dict[str, Any]] = None):
         self.config = config
+        self.metadata = dict(metadata or {})
         self.records: List[AttentionRecord] = []
         self._step_index: Optional[int] = None
         self._timestep: Optional[float] = None
+        self._storage_keys = set()
+        self._storage_refcounts: Dict[Any, List[int]] = {}
+        self._capture_bytes = 0
+        self._peak_capture_bytes = 0
 
     @property
     def step_index(self) -> Optional[int]:
@@ -26,20 +31,90 @@ class AttentionCollector:
         return self._timestep
 
     def clear(self) -> None:
+        self._clear_records(reset_peak=True)
+        self._step_index = None
+        self._timestep = None
+
+    @property
+    def capture_bytes(self) -> int:
+        return self._capture_bytes
+
+    @property
+    def peak_capture_bytes(self) -> int:
+        return self._peak_capture_bytes
+
+    def add_record(self, record: AttentionRecord) -> None:
+        self.records.append(record)
+        self._retain_record_storage(record)
+        self._peak_capture_bytes = max(self._peak_capture_bytes, self._capture_bytes)
+        budget = self.config.max_capture_bytes
+        if budget is not None and self._capture_bytes > budget:
+            self.records.pop()
+            self._release_record_storage(record)
+            raise RuntimeError(
+                f"Capture storage would exceed {_format_bytes(budget)} "
+                f"({self._capture_bytes:,} bytes already retained). Use timesteps='last', "
+                "select fewer layers/query indices, lower dtype precision, or increase "
+                "max_capture_bytes."
+            )
+
+    def _clear_records(self, *, reset_peak: bool) -> None:
         self.records.clear()
+        self._storage_keys.clear()
+        self._storage_refcounts.clear()
+        self._capture_bytes = 0
+        if reset_peak:
+            self._peak_capture_bytes = 0
+
+    def _rebuild_storage_accounting(self) -> None:
+        self._storage_keys.clear()
+        self._storage_refcounts.clear()
+        self._capture_bytes = 0
+        for record in self.records:
+            self._retain_record_storage(record)
+        self._peak_capture_bytes = max(self._peak_capture_bytes, self._capture_bytes)
+
+    def _retain_record_storage(self, record: AttentionRecord) -> None:
+        for key, size in _record_storages(record):
+            state = self._storage_refcounts.get(key)
+            if state is None:
+                self._storage_refcounts[key] = [1, size]
+                self._storage_keys.add(key)
+                self._capture_bytes += size
+            else:
+                state[0] += 1
+
+    def _release_record_storage(self, record: AttentionRecord) -> None:
+        for key, _ in _record_storages(record):
+            state = self._storage_refcounts.get(key)
+            if state is None:
+                continue
+            state[0] -= 1
+            if state[0] <= 0:
+                self._capture_bytes -= state[1]
+                self._storage_keys.discard(key)
+                del self._storage_refcounts[key]
+
+    def _candidate_storage_bytes(self, record: AttentionRecord) -> int:
+        return self._capture_bytes + sum(
+            size for key, size in _record_storages(record) if key not in self._storage_refcounts
+        )
 
     def set_step(self, step_index: Optional[int] = None, timestep: Any = None) -> None:
         next_timestep = _to_float(timestep)
+        timestep_changed = next_timestep is not None and next_timestep != self._timestep
         if (
             self.config.timesteps == "last"
-            and next_timestep is not None
             and self._timestep is not None
-            and next_timestep != self._timestep
+            and timestep_changed
         ):
             # Keep generation unchanged while retaining only the most recent
             # denoising step's records. This bounds VRAM for full patch maps.
-            self.records.clear()
-        self._step_index = step_index
+            self._clear_records(reset_peak=False)
+        if step_index is not None:
+            self._step_index = int(step_index)
+        elif timestep_changed:
+            self._step_index = 0 if self._step_index is None else self._step_index + 1
         self._timestep = next_timestep
 
     def enabled_for(self, layer_id: str, timestep: Any = None) -> bool:
@@ -47,7 +122,7 @@ class AttentionCollector:
             patterns = self.config.layers if not isinstance(self.config.layers, str) else [self.config.layers]
             if not any(pattern in layer_id for pattern in patterns):
                 return False
-        if self.config.timesteps not in {"all", "last"}:
+        if not isinstance(self.config.timesteps, str):
             current = _to_int(timestep if timestep is not None else self._timestep)
             if current not in {int(item) for item in self.config.timesteps}:
                 return False
@@ -72,10 +147,26 @@ class AttentionCollector:
         torch = require_torch()
         timestep_value = _to_float(timestep) if timestep is not None else self._timestep
         metadata = dict(metadata or {})
+        relations = tuple(iter_supported_relations(layout, self.config.relations))
+        if not relations:
+            return
 
-        for relation in iter_supported_relations(layout, self.config.relations):
+        # Fast mode recomputes maps after generation. Move/cast each complete
+        # Q/K tensor only once per attention call, then retain relation slices
+        # as views of that shared storage. This avoids one full K copy per
+        # requested relation when captured tensors are offloaded.
+        fast_query = None
+        fast_key = None
+        fast_attention_mask = None
+        if self.config.mode == "fast":
+            fast_query = tensor_to_device(query, self.config.offload, self.config.dtype)
+            fast_key = tensor_to_device(key, self.config.offload, self.config.dtype)
+            fast_attention_mask = tensor_to_device(attention_mask, self.config.offload)
+
+        for relation in relations:
             q_range, k_range = layout.relation_ranges(relation)
-            q = query[:, :, q_range.start : q_range.end]
+            q_source = fast_query if fast_query is not None else query
+            q = q_source[:, :, q_range.start : q_range.end]
 
             query_selection = self.config.query_indices
             if self.config.relation_query_indices is not None and relation in self.config.relation_query_indices:
@@ -102,7 +193,7 @@ class AttentionCollector:
             relation_mask = None
             if attention_mask is not None:
                 relation_mask = _slice_query_attention_mask(
-                    attention_mask,
+                    fast_attention_mask if fast_attention_mask is not None else attention_mask,
                     q_range.start,
                     q_range.end,
                     selected_q_indices,
@@ -115,7 +206,7 @@ class AttentionCollector:
                 * len(output_key_indices)
             )
             if (
-                self.config.mode in {"exact", "stream"}
+                self.config.mode == "exact"
                 and map_elements > self.config.max_map_elements
                 and not self.config.allow_large_maps
             ):
@@ -126,8 +217,8 @@ class AttentionCollector:
 
             data = None
             q_store = q
-            k_store = key
-            if self.config.mode in {"exact", "stream"}:
+            k_store = fast_key if fast_key is not None else key
+            if self.config.mode == "exact":
                 data = compute_attention_probs(
                     q,
                     key,
@@ -140,12 +231,6 @@ class AttentionCollector:
                 data = tensor_to_device(data, self.config.offload, self.config.dtype)
                 q_store = None
                 k_store = None
-            else:
-                q_store = tensor_to_device(q_store, self.config.offload, self.config.dtype)
-                k_store = tensor_to_device(key, self.config.offload, self.config.dtype)
-                # Preserve boolean SDPA masks even when captured Q/K tensors
-                # are explicitly cast to another storage dtype.
-                relation_mask = tensor_to_device(relation_mask, self.config.offload)
 
             record_metadata = dict(metadata)
             if query_indices is not None:
@@ -154,7 +239,7 @@ class AttentionCollector:
                 record_metadata["key_indices"] = tuple(key_indices)
             record_metadata["attention_key_indices"] = tuple(output_key_indices)
 
-            self.records.append(
+            self.add_record(
                 AttentionRecord(
                     layer_id=layer_id,
                     relation=relation,
@@ -177,14 +262,17 @@ class AttentionCollector:
                 )
             )
 
-    def compute(self) -> "AttentionMaps":
-        computed = []
-        for record in self.records:
+    def compute(self, compute_device=None) -> "AttentionMaps":
+        """Materialize captured maps, optionally using a transient compute device.
+
+        Q/K may be retained on CPU to keep generation and VAE decoding within
+        VRAM, then copied relation-by-relation to CUDA for fast recomputation.
+        Completed maps still follow ``CaptureConfig.offload``.
+        """
+        for index, record in enumerate(self.records):
             if record.data is not None:
-                computed.append(record)
                 continue
             if record.q is None or record.k is None:
-                computed.append(record)
                 continue
             output_key_indices = record.metadata.get("attention_key_indices")
             output_key_count = len(output_key_indices) if output_key_indices is not None else record.k.shape[-2]
@@ -199,23 +287,57 @@ class AttentionCollector:
                     f"Refusing to compute {map_elements:,} attention values for {record.layer_id} "
                     f"{record.relation}. Use query_indices/key_indices or increase max_map_elements."
                 )
+            compute_q = (
+                tensor_to_device(record.q, compute_device)
+                if compute_device is not None
+                else record.q
+            )
+            compute_k = (
+                tensor_to_device(record.k, compute_device)
+                if compute_device is not None
+                else record.k
+            )
+            compute_mask = (
+                tensor_to_device(record.attention_mask, compute_device)
+                if compute_device is not None
+                else record.attention_mask
+            )
             data = compute_attention_probs(
-                record.q,
-                record.k,
-                attention_mask=record.attention_mask,
+                compute_q,
+                compute_k,
+                attention_mask=compute_mask,
                 scale=record.scale,
                 chunk_size=self.config.chunk_size,
                 heads=self.config.heads,
                 key_indices=record.metadata.get("attention_key_indices"),
             )
             data = tensor_to_device(data, self.config.offload, self.config.dtype)
-            computed.append(replace(record, data=data, q=None, k=None, attention_mask=None))
-        return AttentionMaps(computed)
+            # Replace records as soon as they are computed so the collector
+            # does not keep completed Q/K tensors alive beside output maps.
+            completed = replace(record, data=data, q=None, k=None, attention_mask=None)
+            candidate_bytes = self._candidate_storage_bytes(completed)
+            self._peak_capture_bytes = max(self._peak_capture_bytes, candidate_bytes)
+            budget = self.config.max_capture_bytes
+            if budget is not None and candidate_bytes > budget:
+                raise RuntimeError(
+                    f"Computed attention maps exceed the cumulative capture budget of "
+                    f"{_format_bytes(budget)} ({candidate_bytes:,} bytes at peak). "
+                    "Select fewer relations/layers/query indices, keep only the last timestep, "
+                    "or increase max_capture_bytes."
+                )
+            self._release_record_storage(record)
+            self.records[index] = completed
+            self._retain_record_storage(completed)
+        self._rebuild_storage_accounting()
+        metadata = dict(self.metadata)
+        metadata["peak_capture_bytes"] = self._peak_capture_bytes
+        return AttentionMaps(self.records, metadata=metadata)
 
 
 class AttentionMaps:
-    def __init__(self, records: Iterable[AttentionRecord]):
+    def __init__(self, records: Iterable[AttentionRecord], metadata: Optional[Dict[str, Any]] = None):
         self.records = list(records)
+        self.metadata = dict(metadata or {})
 
     def __len__(self) -> int:
         return len(self.records)
@@ -231,9 +353,17 @@ class AttentionMaps:
 
     def summary(self) -> Dict[str, Any]:
         by_relation = self.by_relation()
+        text_components = sorted(
+            {
+                str(component.get("name", "text"))
+                for record in self.records
+                for component in record.metadata.get("text_components") or []
+            }
+        )
         return {
             "records": len(self.records),
             "relations": {relation: len(items) for relation, items in by_relation.items()},
+            "text_components": text_components,
             "layers": len({record.layer_id for record in self.records}),
             "timesteps": sorted({record.timestep for record in self.records if record.timestep is not None}),
         }
@@ -292,7 +422,9 @@ class AttentionMaps:
                     if float(row_mass.max()) > 1.0 + tolerance:
                         issues.append(f"{relation} {record.layer_id}: linear row mass exceeds one")
                 elif keys_complete:
-                    error = float((row_mass - 1.0).abs().max())
+                    # Fully masked query rows follow SDPA semantics and carry
+                    # zero probability mass; participating rows sum to one.
+                    error = float(torch.minimum(row_mass.abs(), (row_mass - 1.0).abs()).max())
                     stats["row_sum_max_error"] = max(stats["row_sum_max_error"], error)
                     if error > tolerance:
                         issues.append(f"{relation} {record.layer_id}: row-sum error {error}")
@@ -304,13 +436,16 @@ class AttentionMaps:
             "skipped_partial_key_groups": 0,
             "skipped_disjoint_query_groups": 0,
             "image_query_max_error": 0.0,
+            "video_query_max_error": 0.0,
             "text_query_max_error": 0.0,
         }
         for group in joint_groups.values():
             evaluated = False
             for query_name, left_relation, right_relation in (
                 ("image", "image->image", "image->text"),
+                ("video", "video->video", "video->text"),
                 ("text", "text->image", "text->text"),
+                ("text", "text->video", "text->text"),
             ):
                 if left_relation not in group or right_relation not in group:
                     continue
@@ -321,7 +456,10 @@ class AttentionMaps:
                 if pair is None:
                     joint_stats["skipped_disjoint_query_groups"] += 1
                     continue
-                error = float((pair[0] + pair[1] - 1.0).abs().max())
+                combined_mass = pair[0] + pair[1]
+                error = float(
+                    torch.minimum(combined_mass.abs(), (combined_mass - 1.0).abs()).max()
+                )
                 stat_name = f"{query_name}_query_max_error"
                 joint_stats[stat_name] = max(joint_stats[stat_name], error)
                 evaluated = True
@@ -329,6 +467,8 @@ class AttentionMaps:
                 joint_stats["groups"] += 1
         if joint_stats["image_query_max_error"] > tolerance:
             issues.append(f"joint image-query normalization error {joint_stats['image_query_max_error']}")
+        if joint_stats["video_query_max_error"] > tolerance:
+            issues.append(f"joint video-query normalization error {joint_stats['video_query_max_error']}")
         if joint_stats["text_query_max_error"] > tolerance:
             issues.append(f"joint text-query normalization error {joint_stats['text_query_max_error']}")
 
@@ -367,6 +507,7 @@ class AttentionMaps:
         tokenizer=None,
         prompts=None,
         images=None,
+        videos=None,
         relation: Optional[str] = None,
         unconditional: Optional[bool] = None,
         visualization_config=None,
@@ -378,25 +519,31 @@ class AttentionMaps:
         When ``relation`` is omitted every captured relation is rendered below
         ``visuals/<query>-to-<key>``. Passing a relation keeps the legacy
         single-relation behavior while using the same renderer. When generated
-        ``images`` are provided, a doubled classifier-free-guidance batch is
-        detected automatically and only its conditional half is visualized.
-        Raw ``.pt`` tensors are optional and are written only when
-        ``save_raw=True``.
+        ``images`` or ``videos`` are provided, a doubled classifier-free-guidance
+        batch is detected automatically and only its conditional half is
+        visualized. Raw ``.pt`` tensors are optional and are written only when
+        ``save_raw=True``; token-concatenated encoder slices are additionally
+        written below ``raw-components``.
         """
         os.makedirs(base_dir, exist_ok=True)
         selected_records = [
             record for record in self.records if relation is None or record.relation == relation
         ]
+        provenance = dict(self.metadata)
+        if prompts is not None:
+            provenance["prompts"] = [prompts] if isinstance(prompts, str) else list(prompts)
         with open(os.path.join(base_dir, "metadata.json"), "w", encoding="utf-8") as handle:
             json.dump(
                 {
                     "summary": self.summary(),
+                    "provenance": provenance,
                     "selected_relation": relation,
                     "records": [record.as_metadata() for record in selected_records],
                 },
                 handle,
                 indent=2,
                 sort_keys=True,
+                default=str,
             )
 
         if save_raw:
@@ -410,6 +557,18 @@ class AttentionMaps:
                 timestep = "none" if record.timestep is None else str(record.timestep).replace(".", "_")
                 filename = f"{index:04d}-{timestep}-{safe_layer}.pt"
                 torch.save(record.data, os.path.join(relation_dir, filename))
+                for component_name, batch_index, component_data in _component_raw_slices(record):
+                    component_dir = os.path.join(
+                        base_dir,
+                        "raw-components",
+                        record.relation.replace("->", "-to-"),
+                        _safe_path_component(component_name),
+                    )
+                    os.makedirs(component_dir, exist_ok=True)
+                    component_filename = (
+                        f"{index:04d}-batch-{batch_index:03d}-{timestep}-{safe_layer}.pt"
+                    )
+                    torch.save(component_data, os.path.join(component_dir, component_filename))
 
         if not save_visualizations:
             return {"relations": {}, "warnings": []}
@@ -424,9 +583,60 @@ class AttentionMaps:
             tokenizer=tokenizer,
             prompts=prompts,
             images=images,
+            videos=videos,
             relations=relations,
             unconditional=unconditional,
         )
+
+
+def _component_raw_slices(record: AttentionRecord):
+    data = record.data
+    components = record.metadata.get("text_components")
+    if data is None or not components:
+        return
+    torch = require_torch()
+    for batch_index in range(int(data.shape[0])):
+        query_axes = _component_axis(record, "query", batch_index, int(data.shape[-2]))
+        key_axes = _component_axis(record, "key", batch_index, int(data.shape[-1]))
+        for query_name, query_positions in query_axes:
+            for key_name, key_positions in key_axes:
+                if query_name is None and key_name is None:
+                    continue
+                query_index = torch.tensor(query_positions, device=data.device, dtype=torch.long)
+                key_index = torch.tensor(key_positions, device=data.device, dtype=torch.long)
+                sliced = data[batch_index : batch_index + 1].index_select(-2, query_index)
+                sliced = sliced.index_select(-1, key_index)
+                yield (
+                    f"{query_name or 'spatial'}-to-{key_name or 'spatial'}",
+                    batch_index,
+                    sliced,
+                )
+
+
+def _component_axis(record: AttentionRecord, axis: str, batch: int, length: int):
+    from .records import parse_relation
+
+    query_name, key_name = parse_relation(record.relation)
+    modality = query_name if axis == "query" else key_name
+    if modality != "text":
+        return [(None, list(range(length)))]
+    selected = record.metadata.get(f"{axis}_indices")
+    original_indices = list(range(length)) if selected is None else [int(item) for item in selected][:length]
+    positions = {original: position for position, original in enumerate(original_indices)}
+    result = []
+    for component in record.metadata.get("text_components") or []:
+        batches = component.get("indices_by_batch") or []
+        if not batches:
+            continue
+        original_component = batches[min(batch, len(batches) - 1)]
+        component_positions = [positions[int(index)] for index in original_component if int(index) in positions]
+        if component_positions:
+            result.append((str(component.get("name", "text")), component_positions))
+    return result or [(None, list(range(length)))]
+
+
+def _safe_path_component(value: str) -> str:
+    return "".join(character if character.isalnum() or character in "-_." else "-" for character in value)
 
 
 def _aligned_query_masses(left: Dict[str, Any], right: Dict[str, Any]):
@@ -471,6 +681,31 @@ def _to_float(value: Any) -> Optional[float]:
 def _to_int(value: Any) -> Optional[int]:
     value = _to_float(value)
     return None if value is None else int(value)
+
+
+def _tensor_storage(tensor):
+    if tensor is None or not hasattr(tensor, "untyped_storage"):
+        return None
+    try:
+        storage = tensor.untyped_storage()
+        key = (str(tensor.device), int(storage.data_ptr()), int(storage.nbytes()))
+        return key, int(storage.nbytes())
+    except (AttributeError, RuntimeError, TypeError):
+        return None
+
+
+def _record_storages(record: AttentionRecord):
+    unique = {}
+    for tensor in (record.data, record.q, record.k, record.attention_mask):
+        storage = _tensor_storage(tensor)
+        if storage is not None:
+            unique[storage[0]] = storage[1]
+    return tuple(unique.items())
+
+
+def _format_bytes(value: int) -> str:
+    gib = value / 1024**3
+    return f"{gib:.2f} GiB"
 
 
 def _slice_query_attention_mask(

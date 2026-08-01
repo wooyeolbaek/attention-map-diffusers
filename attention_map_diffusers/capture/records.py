@@ -10,6 +10,7 @@ class TokenGrid:
     height: Optional[int] = None
     width: Optional[int] = None
     patch_size: Optional[int] = None
+    temporal_patch_size: Optional[int] = None
 
     @property
     def spatial_tokens(self) -> Optional[int]:
@@ -24,6 +25,7 @@ class TokenGrid:
             "height": self.height,
             "width": self.width,
             "patch_size": self.patch_size,
+            "temporal_patch_size": self.temporal_patch_size,
         }
 
 

@@ -10,15 +10,18 @@ from PIL import Image
 from common import MODEL_CONFIGS, model_keys
 
 
-PATCH_PATTERN = re.compile(r"query-patch-(\d+)-y(\d+)-x(\d+)\.png$")
+IMAGE_PATCH_PATTERN = re.compile(r"query-patch-(\d+)-y(\d+)-x(\d+)\.png$")
+VIDEO_PATCH_PATTERN = re.compile(
+    r"query-patch-(\d+)-t(\d+)-y(\d+)-x(\d+)\.gif$"
+)
 
 
-def _verify_png(path: Path, issues: list[str]) -> None:
+def _verify_image(path: Path, issues: list[str]) -> None:
     try:
         with Image.open(path) as image:
             image.verify()
     except Exception as exc:
-        issues.append(f"invalid PNG {path}: {type(exc).__name__}: {exc}")
+        issues.append(f"invalid image {path}: {type(exc).__name__}: {exc}")
 
 
 def validate_model(model_root: Path, key: str) -> dict:
@@ -61,8 +64,11 @@ def validate_model(model_root: Path, key: str) -> dict:
         records_by_relation.setdefault(record["relation"], []).append(record)
         if not record.get("has_data") or record.get("has_qk"):
             issues.append(f"{record['layer_id']} did not finish as a computed attention record")
-        if record.get("metadata", {}).get("query_indices") is not None:
-            issues.append(f"{record['relation']} unexpectedly selected query patches")
+        query_indices = record.get("metadata", {}).get("query_indices")
+        if query_indices is not None:
+            expected_center = config.modality == "video" and record["relation"] == "video->video"
+            if not expected_center or len(query_indices) != 1:
+                issues.append(f"{record['relation']} unexpectedly selected query patches")
         if record.get("metadata", {}).get("key_indices") is not None:
             issues.append(f"{record['relation']} unexpectedly selected key patches")
 
@@ -70,12 +76,19 @@ def validate_model(model_root: Path, key: str) -> dict:
     for relation in config.relations:
         relation_slug = relation.replace("->", "-to-")
         batch_root = attention_root / "visuals" / relation_slug / "aggregate" / "batch-000"
-        map_root = batch_root / "maps"
-        overlay_root = batch_root / "overlays"
-        maps = sorted(map_root.glob("*.png"))
-        overlays = sorted(overlay_root.glob("*.png")) if overlay_root.is_dir() else []
         relation_manifest = manifest.get("relations", {}).get(relation, {})
         aggregate = relation_manifest.get("aggregate")
+        manifest_files = [Path(path) for path in (aggregate or {}).get("files", [])]
+        spatial_video = "video" in relation and relation != "text->text"
+        output_suffix = ".gif" if spatial_video else ".png"
+        maps = sorted(
+            path for path in manifest_files
+            if "maps" in path.parts and path.suffix.lower() == output_suffix
+        )
+        overlays = sorted(
+            path for path in manifest_files
+            if "overlays" in path.parts and path.suffix.lower() == output_suffix
+        )
         if not aggregate or int(aggregate.get("source_records", 0)) <= 0:
             issues.append(f"{relation}: missing aggregate or source records")
         if not (attention_root / "visuals" / relation_slug / "aggregate" / "overview-batch-000.png").is_file():
@@ -84,8 +97,20 @@ def validate_model(model_root: Path, key: str) -> dict:
             issues.append(f"{relation}: no pure maps")
 
         if relation == "text->text":
-            if [path.name for path in maps] != ["attention-matrix.png"]:
-                issues.append("text->text: expected exactly one token-labelled attention matrix")
+            component_count = max(
+                (
+                    len(record.get("metadata", {}).get("text_components") or [])
+                    for record in records_by_relation.get(relation, [])
+                ),
+                default=0,
+            )
+            expected_matrices = component_count**2 if component_count else 1
+            if len(maps) != expected_matrices or any(
+                path.name != "attention-matrix.png" for path in maps
+            ):
+                issues.append(
+                    f"text->text: expected {expected_matrices} token-labelled component matrix/matrices"
+                )
             if overlays:
                 issues.append("text->text: overlays should not be produced")
         else:
@@ -97,7 +122,7 @@ def validate_model(model_root: Path, key: str) -> dict:
         if relation == "image->image":
             parsed = []
             for path in maps:
-                match = PATCH_PATTERN.match(path.name)
+                match = IMAGE_PATCH_PATTERN.match(path.name)
                 if match is None:
                     issues.append(f"image->image: invalid patch filename {path.name}")
                     continue
@@ -121,8 +146,31 @@ def validate_model(model_root: Path, key: str) -> dict:
                 if any(index != row * width + col for index, row, col in parsed):
                     issues.append("image->image: filename row/column labels do not match patch indices")
 
-        for path in maps + overlays:
-            _verify_png(path, issues)
+        if relation == "video->video":
+            if len(maps) != 1:
+                issues.append(f"video->video: expected one selected query-patch GIF, found {len(maps)}")
+            for path in maps:
+                match = VIDEO_PATCH_PATTERN.match(path.name)
+                if match is None:
+                    issues.append(f"video->video: invalid patch filename {path.name}")
+                    continue
+                index, frame, row, col = (int(value) for value in match.groups())
+                grids = [
+                    record["q_shape"] for record in records_by_relation.get(relation, [])
+                    if record.get("q_shape")
+                ]
+                if grids and all(
+                    index != frame * int(grid["height"]) * int(grid["width"])
+                    + row * int(grid["width"]) + col
+                    for grid in grids
+                ):
+                    issues.append("video->video: filename T/Y/X labels do not match its patch index")
+
+        for path in manifest_files:
+            if not path.is_file():
+                issues.append(f"{relation}: missing visualization file {path}")
+            elif path.suffix.lower() in {".png", ".gif"}:
+                _verify_image(path, issues)
         stats[relation] = {
             "records": len(records_by_relation.get(relation, [])),
             "maps": len(maps),
@@ -130,17 +178,35 @@ def validate_model(model_root: Path, key: str) -> dict:
             "source_records": aggregate.get("source_records") if aggregate else None,
         }
 
-    generated = sorted((model_root / "generated").glob("*.png"))
-    if len(generated) != 1:
-        issues.append(f"expected one generated image, found {len(generated)}")
-        generated_size = None
+    generated_root = model_root / "generated"
+    if config.modality == "video":
+        generated = sorted(generated_root.glob("*.gif"))
+        frame_dirs = [path for path in generated_root.iterdir() if path.is_dir()] if generated_root.is_dir() else []
+        frames = sorted(frame_dirs[0].glob("frame-*.png")) if len(frame_dirs) == 1 else []
+        if len(generated) != 1 or not frames:
+            issues.append("expected one generated GIF and one non-empty frame directory")
+            generated_size = None
+        else:
+            _verify_image(generated[0], issues)
+            for path in frames:
+                _verify_image(path, issues)
+            with Image.open(frames[0]) as image:
+                generated_size = [len(frames), *image.size]
+            expected_size = [config.default_num_frames, config.default_width, config.default_height]
+            if generated_size != expected_size:
+                issues.append(f"generated size={generated_size}, expected={expected_size}")
     else:
-        _verify_png(generated[0], issues)
-        with Image.open(generated[0]) as image:
-            generated_size = list(image.size)
-        expected_size = [config.default_width, config.default_height]
-        if generated_size != expected_size:
-            issues.append(f"generated size={generated_size}, expected={expected_size}")
+        generated = sorted(generated_root.glob("*.png"))
+        if len(generated) != 1:
+            issues.append(f"expected one generated image, found {len(generated)}")
+            generated_size = None
+        else:
+            _verify_image(generated[0], issues)
+            with Image.open(generated[0]) as image:
+                generated_size = list(image.size)
+            expected_size = [config.default_width, config.default_height]
+            if generated_size != expected_size:
+                issues.append(f"generated size={generated_size}, expected={expected_size}")
     if list(attention_root.rglob("*.pt")):
         issues.append("raw .pt files were unexpectedly created")
 
