@@ -27,9 +27,17 @@ beside a glowing blue lantern in a snowy pine forest at dusk.*
 Prompt: *A cinematic tracking shot of a red fox running across pristine snow
 in a pine forest, detailed fur, natural winter light, smooth motion, stable camera.*
 
-| video→text · `fox` | video→video · center patch |
-| :---: | :---: |
-| <img src="./assets/examples/wan-video-text-fox.gif" alt="Wan video-to-text attention" width="360"> | <img src="./assets/examples/wan-video-video-center.gif" alt="Wan video-to-video attention" width="360"> |
+**video→text · `fox`**
+
+<p align="center">
+  <img src="./assets/examples/wan-video-text-fox.gif" alt="Wan video-to-text attention" width="720">
+</p>
+
+**video→video · center patch**
+
+<p align="center">
+  <img src="./assets/examples/wan-video-video-center.gif" alt="Wan video-to-video attention" width="720">
+</p>
 
 Wan exposes cross-attention (`video→text`) and spatial-temporal self-attention
 (`video→video`), so the table shows every relation in its denoiser.
@@ -40,7 +48,7 @@ per-frame PNG output. Spatial labels are off by default.
 
 ## Compatible models
 
-Requires `diffusers>=0.39.0`.
+Requires Python 3.10+ and `diffusers>=0.39.0`.
 
 | Key | Checkpoint | Relations |
 | --- | --- | --- |
@@ -64,7 +72,7 @@ Requires `diffusers>=0.39.0`.
 ## Install
 
 ```bash
-pip install --upgrade attention-map-diffusers
+pip install attention-map-diffusers==1.0.0
 ```
 
 ## Image quick start
