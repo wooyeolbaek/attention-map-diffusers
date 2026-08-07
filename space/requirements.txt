@@ -1,0 +1,7 @@
+attention-map-diffusers==1.0.0
+diffusers==0.39.0
+transformers==5.12.1
+accelerate>=1.10.0
+safetensors>=0.5.3
+sentencepiece>=0.2.0
+protobuf>=5.29.0
