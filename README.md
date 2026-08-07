@@ -7,6 +7,7 @@ image and video pipelines.
 [![CI](https://github.com/wooyeolBaek/attention-map-diffusers/actions/workflows/ci.yml/badge.svg)](https://github.com/wooyeolBaek/attention-map-diffusers/actions/workflows/ci.yml)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18304023.svg)](https://doi.org/10.5281/zenodo.18304023)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Hugging Face Space](https://img.shields.io/badge/%F0%9F%A4%97%20Space-SDXL%20Attention-blue)](https://huggingface.co/spaces/We-Want-GPU/diffusers-cross-attention-map-SDXL-t2i)
 
 ## Visualization
 
